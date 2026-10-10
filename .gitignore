@@ -1,0 +1,9 @@
+/target/
+/dist/
+/spam-quarantine/
+/local_test/
+/eval.jsonl
+.env
+# Local site config (only the .example file is versioned)
+/ai-classification-milter.toml
+.DS_Store

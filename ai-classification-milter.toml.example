@@ -1,0 +1,43 @@
+# ai-classification-milter configuration (TOML). Precedence: env var > this file > defaults.
+# Path selectable via MILTER_CONFIG (default: ./ai-classification-milter.toml).
+# Secrets (api_key) preferably via env: OPENROUTER_API_KEY.
+
+listen = "127.0.0.1:8891"
+
+[openrouter]
+url = "https://openrouter.ai/api/alpha/decisions"
+# api_key = "sk-or-..."   # prefer env OPENROUTER_API_KEY
+models = [
+  "microsoft/microsoft-decision-1",
+  "cloudflare/clef-omni",
+  "upstage/solar-decide-flash",
+  "nace-ai/drex-v1.5",
+  "typesafe/jev-1.13",
+]
+# referer = "https://example.com"  # HTTP-Referer (OpenRouter rankings)
+# title = "ai-classification-milter"              # X-Title
+
+[openrouter.question]
+instructions = "Is this mail spam, phishing or malicious?"
+criteria_true = "The mail is unsolicited bulk mail, phishing, scam, fraud, or contains malicious content, links, or attachments."
+criteria_false = "The mail is legitimate correspondence, an expected newsletter with List-Unsubscribe and aligned authentication, or an expected transactional notification."
+
+[limits]
+llm_timeout_secs = 5
+score_threshold = 0.85
+decision = "any"   # any|majority|all (only when learn_mode=false)
+header_max_count = 200
+header_max_value_chars = 2048
+body_max_bytes = 100000
+llm_body_chars = 4000
+
+[logging]
+spam_dir = "./spam-quarantine"
+eval_log = "./eval.jsonl"
+log_all_mails = false  # true = log every mail as .eml, otherwise only spam
+learn_mode = true      # true = never reject, only tag + log
+
+[whitelist]
+# Sender domains that never reach the models and are accepted immediately
+# (envelope MAIL FROM; subdomains match too, case-insensitive).
+sender_domains = ["example.com", "dept.example.com"]

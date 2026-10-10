@@ -118,5 +118,5 @@ Next steps:
        postfix reload
   4. Smoke test:
        sendmail -v someone@example.com < some.eml && tail -50 /var/log/mail.log
-       # look for X-LLM-Verdict in the delivered headers
+       # look for X-AIClassifier-Verdict in the delivered headers
 EOF

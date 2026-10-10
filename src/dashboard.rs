@@ -443,7 +443,7 @@ fn read_sidecar_json(
             }
         })
         .collect();
-    // Compact summary like the X-LLM-Verdict tag (fallback for JSON API readers).
+    // Compact summary like the X-AIClassifier-Verdict tag (fallback for JSON readers).
     let mut parts: Vec<String> = Vec::new();
     for m in models.iter().take(6) {
         if m.err {

@@ -38,7 +38,7 @@ wrong in the "block" direction, mail is lost.
 
 - Model errors, timeouts and malformed answers must **never** count as spam.
 - `combine()` returns `false` when there are zero successful answers.
-- Total model failure → `Continue` + `X-LLM-Verdict: temperror`, never `Reject`.
+- Total model failure → `Continue` + `X-AIClassifier-Verdict: temperror`, never `Reject`.
 - No `unwrap()` / `expect()` / `panic!` on the EOM hot path. Everything there returns a
   `Status` and lets the mail through. (Tests may `unwrap` freely.)
 - The only `Status::Reject` in the codebase is the explicit `learn_mode = false` spam

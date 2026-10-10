@@ -23,13 +23,13 @@ criteria_true = "The mail is unsolicited bulk mail, phishing, scam, fraud, or co
 criteria_false = "The mail is legitimate correspondence, an expected newsletter with List-Unsubscribe and aligned authentication, or an expected transactional notification."
 
 [limits]
-llm_timeout_secs = 5
+model_timeout_secs = 5
 score_threshold = 0.85
 decision = "any"   # any|majority|all (only when learn_mode=false)
 header_max_count = 200
 header_max_value_chars = 2048
 body_max_bytes = 100000
-llm_body_chars = 4000
+model_body_chars = 4000
 
 [logging]
 spam_dir = "./spam-quarantine"

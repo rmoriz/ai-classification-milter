@@ -1,7 +1,7 @@
-//! ai-classification-milter: header (+ body excerpt) -> N decision LLMs parallel -> tag/reject + eval log.
+//! ai-classification-milter: header (+ body excerpt) -> N decision models in parallel -> tag/reject + eval log.
 //!
 //! Flow: MAIL (reset) -> RCPT* -> HEADER* -> BODY* -> EOM (one fan-out to all models).
-//! Fail-open: any LLM error, all-LLM error, or a milter crash -> Postfix accepts
+//! Fail-open: any model error, total model failure, or a milter crash -> Postfix accepts
 //! (requires milter_default_action=accept / per-milter default_action=accept).
 
 use bytes::Bytes;
@@ -48,14 +48,14 @@ struct AppConfig {
     pub question_instructions: String,
     pub question_true: String,
     pub question_false: String,
-    pub llm_api_key: Option<String>,
-    pub llm_timeout: Duration,
+    pub api_key: Option<String>,
+    pub model_timeout: Duration,
     pub score_threshold: f32,
     pub decision: Decision,
     pub header_max_count: usize,
     pub header_max_value_chars: usize,
     pub body_max_bytes: usize,
-    pub llm_body_chars: usize,
+    pub model_body_chars: usize,
     pub log_spam_dir: PathBuf,
     pub eval_log: PathBuf,
     pub log_all_mails: bool, // true = log every mail as .eml (eval), otherwise only spam
@@ -189,13 +189,13 @@ struct QuestionSection {
 
 #[derive(Debug, Deserialize, Default)]
 struct LimitsSection {
-    llm_timeout_secs: Option<u64>,
+    model_timeout_secs: Option<u64>,
     score_threshold: Option<f32>,
     decision: Option<String>,
     header_max_count: Option<usize>,
     header_max_value_chars: Option<usize>,
     body_max_bytes: Option<usize>,
-    llm_body_chars: Option<usize>,
+    model_body_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -256,9 +256,43 @@ fn load_file_config() -> FileConfig {
     }
 }
 
+/// Read an env var, transparently accepting a deprecated alias.
+/// A hit on the old name logs a warning so operators can migrate — silently
+/// falling back to the default would change behaviour without any signal.
+fn env_or_deprecated(env: &dyn Fn(&str) -> Option<String>, new: &str, old: &str) -> Option<String> {
+    match env(new) {
+        Some(v) => {
+            if env(old).is_some() {
+                warn!(
+                    old = old,
+                    new = new,
+                    "deprecated env var set, ignored — rename it"
+                );
+            }
+            Some(v)
+        }
+        None => env(old).inspect(|_| {
+            warn!(old = old, new = new, "deprecated env var used — rename it");
+        }),
+    }
+}
+
+/// Current env var name -> removed legacy name. The project talks to a decision
+/// model, not a chat LLM, so the `LLM_*` prefix is gone.
+fn deprecated_alias(current: &str) -> &'static str {
+    match current {
+        "MODEL_TIMEOUT_SECS" => "LLM_TIMEOUT_SECS",
+        "MODEL_BODY_CHARS" => "LLM_BODY_CHARS",
+        "MODEL_API_KEY" => "LLM_API_KEY",
+        _ => "\u{0}", // no alias; never matches a real env var
+    }
+}
+
 impl AppConfig {
     fn load() -> Self {
-        let env = |k: &str| std::env::var(k).ok();
+        let raw_env = |k: &str| std::env::var(k).ok();
+        let env = |k: &str| env_or_deprecated(&raw_env, k, deprecated_alias(k));
+        let env = &env;
         let fc = load_file_config();
         let or = fc.openrouter.unwrap_or_default();
         let lim = fc.limits.unwrap_or_default();
@@ -368,13 +402,13 @@ impl AppConfig {
             question_instructions,
             question_true,
             question_false,
-            llm_api_key: env("OPENROUTER_API_KEY")
-                .or_else(|| env("LLM_API_KEY"))
+            api_key: env("OPENROUTER_API_KEY")
+                .or_else(|| env("MODEL_API_KEY"))
                 .or(or.api_key),
-            llm_timeout: Duration::from_secs(
-                env("LLM_TIMEOUT_SECS")
+            model_timeout: Duration::from_secs(
+                env("MODEL_TIMEOUT_SECS")
                     .and_then(|v| v.parse().ok())
-                    .or(lim.llm_timeout_secs)
+                    .or(lim.model_timeout_secs)
                     .unwrap_or(5),
             ),
             score_threshold: env("SCORE_THRESHOLD")
@@ -394,9 +428,9 @@ impl AppConfig {
                 .and_then(|v| v.parse().ok())
                 .or(lim.body_max_bytes)
                 .unwrap_or(100_000),
-            llm_body_chars: env("LLM_BODY_CHARS")
+            model_body_chars: env("MODEL_BODY_CHARS")
                 .and_then(|v| v.parse().ok())
-                .or(lim.llm_body_chars)
+                .or(lim.model_body_chars)
                 .unwrap_or(4000),
             log_spam_dir: PathBuf::from(
                 env("LOG_SPAM_DIR")
@@ -560,7 +594,7 @@ impl MailState {
     }
 }
 
-// ---------------------------------------------------------------- LLM types
+// -------------------------------------------------------------- model types
 
 #[derive(Debug, Serialize, Clone)]
 struct LlmRequest {
@@ -834,8 +868,8 @@ async fn query_openrouter(
     let mut b = client()
         .post(&cfg.openrouter_url)
         .json(&body)
-        .timeout(cfg.llm_timeout);
-    if let Some(key) = &cfg.llm_api_key {
+        .timeout(cfg.model_timeout);
+    if let Some(key) = &cfg.api_key {
         b = b.bearer_auth(key);
     }
     if let Some(r) = &cfg.openrouter_referer {
@@ -882,13 +916,13 @@ async fn query_legacy(
 ) -> Result<LlmVerdict, String> {
     let mut req = base.clone();
     req.model = ep.name.clone();
-    let mut b = client().post(&ep.url).json(&req).timeout(cfg.llm_timeout);
-    if let Some(key) = &cfg.llm_api_key {
+    let mut b = client().post(&ep.url).json(&req).timeout(cfg.model_timeout);
+    if let Some(key) = &cfg.api_key {
         b = b.bearer_auth(key);
     }
     let resp = b.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("llm http {}", resp.status()));
+        return Err(format!("model http {}", resp.status()));
     }
     resp.json::<LlmVerdict>().await.map_err(|e| e.to_string())
 }
@@ -1161,7 +1195,7 @@ async fn run_cli(cfg: &AppConfig, json_out: bool) -> std::io::Result<()> {
             return Ok(());
         }
         println!(
-            "WHITELISTED (sender domain): {} -> ham (no LLM call)",
+            "WHITELISTED (sender domain): {} -> ham (no model call)",
             envelope_from
         );
         return Ok(());
@@ -1175,7 +1209,7 @@ async fn run_cli(cfg: &AppConfig, json_out: bool) -> std::io::Result<()> {
         envelope_from: String::new(),
         envelope_rcpts: Vec::new(),
         headers: state.headers.clone(),
-        body_excerpt: body_text.chars().take(cfg.llm_body_chars).collect(),
+        body_excerpt: body_text.chars().take(cfg.model_body_chars).collect(),
         body_truncated: state.body_truncated,
     };
 
@@ -1359,7 +1393,7 @@ async fn main() -> std::io::Result<()> {
 
                     // Whitelisted sender domain: no model call, accept immediately + tag.
                     if is_sender_whitelisted(&cfg, &state.sender, &state.headers) {
-                        info!(queue_id = %queue_id, sender = %state.sender, "whitelisted sender domain, skip LLM");
+                        info!(queue_id = %queue_id, sender = %state.sender, "whitelisted sender domain, skip model");
                         record_stats(&stats, &queue_id, &state.sender, false, true, false, &[]);
                         append_eval_log(&cfg, &serde_json::json!({
                             "ts": Local::now().to_rfc3339(),
@@ -1374,12 +1408,12 @@ async fn main() -> std::io::Result<()> {
                             log_mail_eml(&cfg, &queue_id, "whitelisted",
                                 &state, &[], &state.sender, &state.recipients).await;
                         }
-                        let _ = ctx.actions.add_header("X-LLM-Verdict", "whitelisted").await;
+                        let _ = ctx.actions.add_header("X-AIClassifier-Verdict", "whitelisted").await;
                         return Status::Continue;
                     }
 
                     let body_text = String::from_utf8_lossy(&state.body);
-                    let excerpt: String = body_text.chars().take(cfg.llm_body_chars).collect();
+                    let excerpt: String = body_text.chars().take(cfg.model_body_chars).collect();
                     let base = LlmRequest {
                         model: String::new(), // set per model
                         queue_id: queue_id.clone(),
@@ -1418,13 +1452,13 @@ async fn main() -> std::io::Result<()> {
 
                     if ok_count == 0 {
                         warn!(queue_id = %queue_id, "all models failed, fail-open");
-                        let _ = ctx.actions.add_header("X-LLM-Verdict", "temperror").await;
+                        let _ = ctx.actions.add_header("X-AIClassifier-Verdict", "temperror").await;
                         return Status::Continue;
                     }
 
                     if spam {
                         if cfg.learn_mode {
-                            let _ = ctx.actions.add_header("X-LLM-Verdict", verdict_tag(&outcomes)).await;
+                            let _ = ctx.actions.add_header("X-AIClassifier-Verdict", verdict_tag(&outcomes)).await;
                             return Status::Continue;
                         }
                         let _ = ctx.reply.set_error_reply(
@@ -1435,7 +1469,7 @@ async fn main() -> std::io::Result<()> {
                         return Status::Reject;
                     }
 
-                    let _ = ctx.actions.add_header("X-LLM-Verdict", verdict_tag(&outcomes)).await;
+                    let _ = ctx.actions.add_header("X-AIClassifier-Verdict", verdict_tag(&outcomes)).await;
                     Status::Continue
                 })
             }
@@ -1512,14 +1546,14 @@ mod tests {
             question_instructions: DEFAULT_QUESTION.into(),
             question_true: DEFAULT_CRITERIA_TRUE.into(),
             question_false: DEFAULT_CRITERIA_FALSE.into(),
-            llm_api_key: None,
-            llm_timeout: Duration::from_secs(5),
+            api_key: None,
+            model_timeout: Duration::from_secs(5),
             score_threshold: 0.85,
             decision: Decision::Any,
             header_max_count: 3,
             header_max_value_chars: 5,
             body_max_bytes: 10,
-            llm_body_chars: 4000,
+            model_body_chars: 4000,
             log_spam_dir: unique_tmp("cfg-spam"),
             eval_log: unique_tmp("cfg-eval").join("eval.jsonl"),
             log_all_mails: false,
@@ -1706,7 +1740,7 @@ mod tests {
             [openrouter.question]
             instructions = "Q?"
             [limits]
-            llm_timeout_secs = 7
+            model_timeout_secs = 7
             decision = "majority"
             [logging]
             learn_mode = false
@@ -1864,7 +1898,7 @@ mod tests {
         assert_eq!(v[0].name, "ok");
 
         // 5. legacy entries without '=' -> single fallback model, named by
-        //    LLM_MODEL / LLM_URL (defaults if unset)
+        //    LLM_MODEL / LLM_URL (defaults if unset; legacy MODELS mode only)
         let broken = |k: &str| match k {
             "MODELS" => Some("noequals,alsonone".into()),
             "OPENROUTER_MODELS" => Some(" ".into()),
@@ -1875,7 +1909,7 @@ mod tests {
         assert_eq!(v[0].name, "spam-decision", "built-in fallback name");
         assert_eq!(v[0].url, "http://127.0.0.1:11434/v1/chat/completions");
 
-        // LLM_MODEL / LLM_URL override the fallback name and endpoint
+        // legacy MODELS mode still uses LLM_MODEL / LLM_URL for the single fallback
         let named = |k: &str| match k {
             "MODELS" => Some("noequals".into()),
             "OPENROUTER_MODELS" => Some(" ".into()),
@@ -2018,6 +2052,58 @@ mod tests {
         assert_eq!(
             sender_domain("user@sub.example.com"),
             Some("sub.example.com".into())
+        );
+    }
+
+    #[test]
+    fn deprecated_env_aliases() {
+        let none = |_: &str| None;
+        assert_eq!(
+            env_or_deprecated(&none, "MODEL_TIMEOUT_SECS", "LLM_TIMEOUT_SECS"),
+            None
+        );
+
+        // old name only -> value honoured (backwards compatible)
+        let old = |k: &str| {
+            if k == "LLM_TIMEOUT_SECS" {
+                Some("9".into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            env_or_deprecated(&old, "MODEL_TIMEOUT_SECS", "LLM_TIMEOUT_SECS"),
+            Some("9".into())
+        );
+
+        // new name wins when both are set
+        let both = |k: &str| match k {
+            "MODEL_TIMEOUT_SECS" => Some("1".into()),
+            "LLM_TIMEOUT_SECS" => Some("9".into()),
+            _ => None,
+        };
+        assert_eq!(
+            env_or_deprecated(&both, "MODEL_TIMEOUT_SECS", "LLM_TIMEOUT_SECS"),
+            Some("1".into()),
+            "new name must win"
+        );
+
+        // alias table covers exactly the renamed options
+        assert_eq!(deprecated_alias("MODEL_TIMEOUT_SECS"), "LLM_TIMEOUT_SECS");
+        assert_eq!(deprecated_alias("MODEL_BODY_CHARS"), "LLM_BODY_CHARS");
+        assert_eq!(deprecated_alias("MODEL_API_KEY"), "LLM_API_KEY");
+        // unmapped names yield a sentinel that never matches a real env var
+        let sentinel = deprecated_alias("SCORE_THRESHOLD");
+        let only_new = |k: &str| {
+            if k == "SCORE_THRESHOLD" {
+                Some("0.85".into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            env_or_deprecated(&only_new, "SCORE_THRESHOLD", sentinel),
+            Some("0.85".into())
         );
     }
 

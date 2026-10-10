@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+env:
+  BIN: ai-classification-milter
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            out: ai-classification-milter-linux-amd64
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            out: ai-classification-milter-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools (Linux static build)
+        if: matrix.name == 'linux-amd64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "dist/${{ matrix.out }}"
+          chmod +x "dist/${{ matrix.out }}"
+          ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: dist/${{ matrix.out }}
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Rename with tag version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p release
+          cp "dist/ai-classification-milter-linux-amd64/ai-classification-milter-linux-amd64" \
+            "release/${{ env.BIN }}-${TAG}-linux-amd64"
+          cp "dist/ai-classification-milter-macos-arm64/ai-classification-milter-macos-arm64" \
+            "release/${{ env.BIN }}-${TAG}-macos-arm64"
+          chmod +x release/*
+          ls -la release/
+          sha256sum release/* > release/SHA256SUMS.txt
+          cat release/SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

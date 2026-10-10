@@ -61,6 +61,39 @@ pub struct RecentEntry {
     pub whitelisted: bool,
     pub temperror: bool,
     pub summary: String,
+    pub models: Vec<ModelChip>,
+}
+
+/// One model result for chip rendering (overview + quarantine list).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelChip {
+    pub name: String, // shortened, e.g. "jev-1.13"
+    pub spam: bool,
+    pub err: bool,
+    pub score: f32,
+}
+
+/// "org/model-name…" -> "model-name…" (max 16 chars) for compact chips.
+fn short_model(name: &str) -> String {
+    name.split('/').next_back().unwrap_or(name).chars().take(16).collect()
+}
+
+fn chips_html(models: &[ModelChip]) -> String {
+    let mut h = String::with_capacity(models.len() * 48);
+    for m in models {
+        let (cls, label) = if m.err {
+            ("e", "err".to_string())
+        } else if m.spam {
+            ("s", format!("SPAM {:.2}", m.score))
+        } else {
+            ("h", format!("ham {:.2}", m.score))
+        };
+        h.push_str(&format!(
+            "<span class=\"chip {cls}\">{}</span>",
+            html_escape(&format!("{} · {label}", m.name))
+        ));
+    }
+    h
 }
 
 impl Stats {
@@ -75,7 +108,7 @@ impl Stats {
     }
 
     /// Outcome row as recorded: (model, is_spam, score, latency_ms, cost, error?).
-    pub fn record(&self, entry: RecentEntry, models: &[(String, bool, f32, u64, Option<f64>, bool)]) {
+    pub fn record(&self, mut entry: RecentEntry, models: &[(String, bool, f32, u64, Option<f64>, bool)]) {
         let mut g = match self.inner.write() {
             Ok(g) => g,
             Err(_) => return,
@@ -93,8 +126,13 @@ impl Stats {
             g.ham += 1;
         }
         for (name, is_spam, score, latency_ms, cost, failed) in models {
-            let m = g.per_model.entry(name.clone()).or_default();
-            if *failed {
+            entry.models.push(ModelChip {
+                name: short_model(name),
+                spam: *is_spam,
+                err: *failed,
+                score: *score,
+            });
+            let m = g.per_model.entry(name.clone()).or_default();            if *failed {
                 m.errors += 1;
             } else {
                 m.ok += 1;
@@ -151,30 +189,36 @@ impl Stats {
             "recent": g.recent.iter().map(|r| serde_json::json!({
                 "ts": r.ts, "queue_id": r.queue_id, "sender": r.sender,
                 "spam": r.spam, "whitelisted": r.whitelisted, "temperror": r.temperror,
-                "summary": r.summary,
+                "summary": r.summary, "models": r.models,
             })).collect::<Vec<_>>(),
         })
     }
 
-    fn recent_html(&self) -> String {
+    fn recent_html(&self, scr: bool) -> String {
         let g = match self.inner.read() {
             Ok(g) => g,
             Err(_) => return String::new(),
         };
         let mut h = String::from(
-            "<table><tr><th>Zeit</th><th>Queue</th><th>Sender</th><th>Verdict</th><th>Summary</th></tr><tbody id=\"m-recent\">",
+            "<table><tr><th>Time</th><th>Queue</th><th>Sender</th><th>Verdict</th><th>Models</th></tr><tbody id=\"m-recent\">",
         );
         if g.recent.is_empty() {
-            h.push_str("<tr><td colspan=5><i>Noch keine Mails seit Start.</i></td></tr>");
+            h.push_str("<tr><td colspan=5><i>No mails since start.</i></td></tr>");
         }
         for r in g.recent.iter().take(20) {
+            let detail = if r.models.is_empty() {
+                html_escape(&r.summary)
+            } else {
+                chips_html(&r.models)
+            };
             h.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td{}>{}</td><td>{}</td><td>{}</td></tr>",
                 html_escape(&r.ts),
                 html_escape(&r.queue_id),
+                if scr { " class=\"scr\"" } else { "" },
                 html_escape(&r.sender),
                 verdict_badge(r.whitelisted, r.temperror, r.spam),
-                html_escape(&r.summary)
+                detail
             ));
         }
         h.push_str("</tbody></table>");
@@ -194,7 +238,7 @@ impl Stats {
             <div class=card><b id=\"c-ham\">{ham}</b><span>ham</span></div>\
             <div class=card><b id=\"c-wl\">{wl}</b><span>whitelisted</span></div>\
             <div class=card><b id=\"c-terr\">{terr}</b><span>temperror</span></div>\
-            <div class=card><b id=\"c-q\">{quarantine_count}</b><span>quarantäne-dateien</span></div>\
+            <div class=card><b id=\"c-q\">{quarantine_count}</b><span>quarantined files</span></div>\
             </div>"
         )
     }
@@ -205,10 +249,10 @@ impl Stats {
             Err(_) => Vec::new(),
         };
         let mut h = String::from(
-            "<h2>Modelle</h2><table><tr><th>Modell</th><th>ok</th><th>spam</th><th>err</th><th>avg score</th><th>avg lat</th><th>kosten $</th></tr><tbody id=\"m-models\">",
+            "<h2>Models</h2><table><tr><th>Model</th><th>ok</th><th>spam</th><th>err</th><th>avg score</th><th>avg latency</th><th>cost $</th></tr><tbody id=\"m-models\">",
         );
         if rows.is_empty() {
-            h.push_str("<tr><td colspan=7><i>keine Daten</i></td></tr>");
+            h.push_str("<tr><td colspan=7><i>no data</i></td></tr>");
         }
         let mut rows = rows;
         rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -240,7 +284,9 @@ pub struct QuarantineMail {
     pub size: u64,
     pub sender: String,
     pub spam: Option<bool>,
+    pub verdict: Option<String>, // "spam" | "ham" | "whitelisted" (sidecar), None for legacy files
     pub summary: String,
+    pub models: Vec<ModelChip>,
 }
 
 pub fn quarantine_count(dir: &Path) -> usize {
@@ -274,8 +320,8 @@ pub fn list_quarantine(dir: &Path, q: &str, limit: usize, offset: usize) -> (Vec
                 (t, m.len())
             })
             .unwrap_or((0, 0));
-        let (sender, spam, summary) = read_sidecar_json(dir, &stem);
-        all.push(QuarantineMail { stem, mtime_unix, size, sender, spam, summary });
+        let (sender, spam, verdict, summary, models) = read_sidecar_json(dir, &stem);
+        all.push(QuarantineMail { stem, mtime_unix, size, sender, spam, verdict, summary, models });
     }
     all.sort_by(|a, b| b.mtime_unix.cmp(&a.mtime_unix).then(a.stem.cmp(&b.stem)));
     if !q.is_empty() {
@@ -287,29 +333,39 @@ pub fn list_quarantine(dir: &Path, q: &str, limit: usize, offset: usize) -> (Vec
     (items, total)
 }
 
-fn read_sidecar_json(dir: &Path, stem: &str) -> (String, Option<bool>, String) {
-    let p = dir.join(format!("{stem}.json"));
-    let Ok(s) = std::fs::read_to_string(&p) else { return (String::new(), None, String::new()) };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else { return (String::new(), None, String::new()) };
+fn read_sidecar_json(dir: &Path, stem: &str) -> (String, Option<bool>, Option<String>, String, Vec<ModelChip>) {
+    let empty = || (String::new(), None, None, String::new(), Vec::new());
+    let Ok(s) = std::fs::read_to_string(dir.join(format!("{stem}.json"))) else { return empty() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else { return empty() };
     let sender = v.get("envelope_from").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let verdict = v.get("verdict").and_then(|x| x.as_str()).map(str::to_string);
     let outcomes = v.get("outcomes").and_then(|x| x.as_array()).cloned().unwrap_or_default();
-    // Compact summary like the X-LLM-Verdict tag.
+    let models: Vec<ModelChip> = outcomes
+        .iter()
+        .take(8)
+        .map(|o| {
+            let model = o.get("model").and_then(|x| x.as_str()).unwrap_or("?");
+            ModelChip {
+                name: short_model(model),
+                spam: o.get("is_spam").and_then(|x| x.as_bool()).unwrap_or(false),
+                err: o.get("error").and_then(|x| x.as_str()).is_some(),
+                score: o.get("verdict").and_then(|x| x.get("score")).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+            }
+        })
+        .collect();
+    // Compact summary like the X-LLM-Verdict tag (fallback for JSON API readers).
     let mut parts: Vec<String> = Vec::new();
-    for o in outcomes.iter().take(6) {
-        let model = o.get("model").and_then(|x| x.as_str()).unwrap_or("?");
-        let short: String = model.split('/').next_back().unwrap_or(model).chars().take(14).collect();
-        if o.get("error").and_then(|x| x.as_str()).is_some() {
-            parts.push(format!("{short}=err"));
+    for m in models.iter().take(6) {
+        if m.err {
+            parts.push(format!("{}=err", m.name));
         } else {
-            let spam = o.get("is_spam").and_then(|x| x.as_bool()).unwrap_or(false);
-            let score = o.get("verdict").and_then(|x| x.get("score")).and_then(|x| x.as_f64()).unwrap_or(0.0);
-            parts.push(format!("{short}={}:{score:.2}", if spam { "spam" } else { "ham" }));
+            parts.push(format!("{}={}:{:.2}", m.name, if m.spam { "spam" } else { "ham" }, m.score));
         }
     }
     let summary: String = parts.join(" | ").chars().take(160).collect();
     // spam flag is not stored in the sidecar; derive from outcomes when present.
-    let spam = if outcomes.is_empty() { None } else { Some(outcomes.iter().any(|o| o.get("is_spam").and_then(|x| x.as_bool()).unwrap_or(false))) };
-    (sender, spam, summary)
+    let spam = if outcomes.is_empty() { None } else { Some(models.iter().any(|m| m.spam)) };
+    (sender, spam, verdict, summary, models)
 }
 
 pub fn read_mail(dir: &Path, stem: &str) -> Option<(String, String)> {
@@ -435,7 +491,14 @@ form{display:flex;gap:.5rem;margin:1rem 0;flex-wrap:wrap}\
 input[type=text]{padding:.45rem .6rem;width:300px;border:1px solid #cbd5e1;border-radius:8px}\
 button{padding:.45rem 1rem;border:none;border-radius:8px;background:#1d4ed8;color:#fff;font-weight:600;cursor:pointer}\
 button:hover{background:#1e40af}\
-.pager{margin:1rem 0}";
+.pager{margin:1rem 0}\
+.scr{filter:blur(4px);user-select:none;pointer-events:none}\
+.chip{display:inline-block;margin:.12rem .18rem .12rem 0;padding:.12rem .55rem;border-radius:7px;\
+font-size:.76rem;font-weight:600;background:#f1f5f9;border:1px solid #e2e8f0;color:#33415c;\
+font-variant-numeric:tabular-nums;white-space:nowrap}\
+.chip.s{background:#fee2e2;border-color:#fecaca;color:#991b1c}\
+.chip.h{background:#dcfce7;border-color:#bbf7d0;color:#166534}\
+.chip.e{background:#e2e8f0;border-color:#cbd5e1;color:#475569}";
 
 /// Live refresh for the overview page: polls /api/stats every 3s and updates
 /// cards + tables in place (plain HTTP fetch, no WebSocket/SSE needed).
@@ -444,6 +507,11 @@ const tok = new URLSearchParams(location.search).get('token') || '';
 const api = tok ? '/api/stats?token=' + encodeURIComponent(tok) : '/api/stats';
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const badge = (t, c) => '<span class="badge ' + c + '">' + esc(t) + '</span>';
+const chip = m => {
+  const cls = m.err ? 'e' : (m.spam ? 's' : 'h');
+  const v = m.err ? 'err' : ((m.spam ? 'SPAM ' : 'ham ') + Number(m.score || 0).toFixed(2));
+  return '<span class="chip ' + cls + '">' + esc(m.name + ' · ' + v) + '</span>';
+};
 const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
 async function tick() {
   const dot = document.getElementById('m-dot');
@@ -458,41 +526,85 @@ async function tick() {
       '<tr><td>' + esc(n) + '</td><td>' + m.ok + '</td><td>' + m.spam + '</td><td>' + m.errors +
       '</td><td>' + Number(m.avg_score || 0).toFixed(3) + '</td><td>' + m.avg_latency_ms +
       'ms</td><td>$' + Number(m.cost_usd || 0).toFixed(5) + '</td></tr>').join('')
-      || '<tr><td colspan="7"><i>keine Daten</i></td></tr>';
+      || '<tr><td colspan="7"><i>no data</i></td></tr>';
     document.getElementById('m-recent').innerHTML = (d.recent || []).slice(0, 20).map(x => {
       const v = x.whitelisted ? badge('whitelisted', 'w') : x.temperror ? badge('temperror', 't')
         : x.spam ? badge('SPAM', 's') : badge('ham', 'h');
-      return '<tr><td>' + esc(x.ts) + '</td><td>' + esc(x.queue_id) + '</td><td>' + esc(x.sender) +
-        '</td><td>' + v + '</td><td>' + esc(x.summary) + '</td></tr>';
-    }).join('') || '<tr><td colspan="5"><i>Noch keine Mails seit Start.</i></td></tr>';
-    set('m-updated', 'live · aktualisiert ' + new Date().toLocaleTimeString());
+      const cls = (typeof SCRAMBLE !== 'undefined' && SCRAMBLE) ? ' class="scr"' : '';
+      const det = (x.models && x.models.length) ? x.models.map(chip).join(' ') : esc(x.summary);
+      return '<tr><td>' + esc(x.ts) + '</td><td>' + esc(x.queue_id) + '</td><td' + cls + '>' + esc(x.sender) +
+        '</td><td>' + v + '</td><td>' + det + '</td></tr>';
+    }).join('') || '<tr><td colspan="5"><i>No mails since start.</i></td></tr>';
+    set('m-updated', 'live · updated ' + new Date().toLocaleTimeString());
     if (dot) { dot.textContent = '●'; dot.className = 'dot on'; }
   } catch (e) {
     if (dot) { dot.textContent = '●'; dot.className = 'dot off'; }
-    set('m-updated', 'offline — versuche erneut …');
+    set('m-updated', 'offline — retrying …');
   }
 }
 tick(); setInterval(tick, 3000);
 </script>"#;
 
-/// Raw token from the query so generated links keep working under token auth.
-fn qtoken(query: &HashMap<String, String>) -> &str {
-    query.get("token").map(String::as_str).unwrap_or("")
-}
-
-/// Internal link builder, preserving ?token= when present.
-fn href(base: &str, tok: &str, params: &[(&str, &str)]) -> String {
-    let mut q = String::new();
-    if !tok.is_empty() {
-        q.push_str(&format!("token={}", url_encode(tok)));
+/// Internal link builder, preserving ?token= and ?scramble= when present.
+/// Explicit `params` override kept keys (used for the scramble toggle).
+fn href_q(base: &str, query: &HashMap<String, String>, params: &[(&str, &str)]) -> String {
+    let over: Vec<&str> = params.iter().map(|(k, _)| *k).collect();
+    let mut q: Vec<String> = Vec::new();
+    for key in ["token", "scramble"] {
+        if over.contains(&key) {
+            continue;
+        }
+        if let Some(v) = query.get(key) {
+            q.push(format!("{key}={}", url_encode(v)));
+        }
     }
     for (k, v) in params {
-        if !q.is_empty() {
-            q.push('&');
-        }
-        q.push_str(&format!("{k}={}", url_encode(v)));
+        q.push(format!("{k}={}", url_encode(v)));
     }
-    if q.is_empty() { base.to_string() } else { format!("{base}?{q}") }
+    if q.is_empty() { base.to_string() } else { format!("{base}?{}", q.join("&")) }
+}
+
+/// Hidden form fields carrying token/scramble through GET forms.
+fn hidden_keep(query: &HashMap<String, String>) -> String {
+    let mut h = String::new();
+    for key in ["token", "scramble"] {
+        if let Some(v) = query.get(key) {
+            h.push_str(&format!("<input type=hidden name={key} value=\"{}\">", html_escape(v)));
+        }
+    }
+    h
+}
+
+/// Effective sender scrambling: ?scramble=1/0 wins, else the config default.
+fn eff_scramble(query: &HashMap<String, String>, default: bool) -> bool {
+    match query.get("scramble").map(String::as_str) {
+        Some("1") | Some("true") | Some("on") => true,
+        Some("0") | Some("false") | Some("off") => false,
+        _ => default,
+    }
+}
+
+/// Display-only sender redaction for <pre> blocks (CSS can't target substrings).
+fn redact_sender(text: &str, sender: &str) -> String {
+    if sender.is_empty() {
+        return text.to_string();
+    }
+    text.replace(sender, "•••@•••")
+}
+
+/// Badge for the quarantine list: prefer the stored verdict
+/// ("spam"|"ham"|"whitelisted"), fall back to the derived spam flag.
+fn mail_badge(m: &QuarantineMail) -> &'static str {
+    match m.verdict.as_deref() {
+        Some("whitelisted") => "<span class=\"badge w\">whitelisted</span>",
+        Some("spam") => "<span class=\"badge s\">SPAM</span>",
+        Some("ham") => "<span class=\"badge h\">ham</span>",
+        _ => match m.spam {
+            Some(true) => "<span class=\"badge s\">SPAM</span>",
+            Some(false) => "<span class=\"badge h\">ham</span>",
+            None => "-",
+        },
+    }
 }
 
 fn verdict_badge(whitelisted: bool, temperror: bool, spam: bool) -> &'static str {
@@ -507,15 +619,19 @@ fn verdict_badge(whitelisted: bool, temperror: bool, spam: bool) -> &'static str
     }
 }
 
-fn page(title: &str, body: &str, tok: &str, script: &str) -> String {
+fn page(title: &str, body: &str, query: &HashMap<String, String>, script: &str, scr: bool, here: &str) -> String {
+    let toggle = if scr { "0" } else { "1" };
     let nav = format!(
-        "<nav class=top><a href=\"{}\">Stats</a><a href=\"{}\">Spam-Mails</a><span class=sp></span><a href=\"{}\">JSON</a></nav>",
-        href("/", tok, &[]),
-        href("/mails", tok, &[]),
-        href("/api/stats", tok, &[]),
+        "<nav class=top><a href=\"{}\">Stats</a><a href=\"{}\">Quarantine</a><span class=sp></span>\
+        <a href=\"{}\">Scramble: {}</a><a href=\"{}\">JSON</a></nav>",
+        href_q("/", query, &[]),
+        href_q("/mails", query, &[]),
+        href_q(here, query, &[("scramble", toggle)]),
+        if scr { "on" } else { "off" },
+        href_q("/api/stats", query, &[]),
     );
     format!(
-        "<!doctype html><html lang=de><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
         <title>{}</title><style>{}</style></head><body>{}<h1>{}</h1>{}{}</body></html>",
         html_escape(title),
         CSS,
@@ -532,6 +648,7 @@ pub struct DashboardOpts {
     pub stats: Arc<Stats>,
     pub spam_dir: PathBuf,
     pub token: Option<String>,
+    pub scramble_senders: bool, // config default; ?scramble=1/0 overrides per request
 }
 
 fn authorized(headers: &str, query: &HashMap<String, String>, token: &Option<String>) -> bool {
@@ -591,20 +708,29 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
     }
     let path = decode_component(path, false);
     tracing::debug!(method = method, path = %path, "dashboard request");
-
+    let scr = eff_scramble(&query, opts.scramble_senders);
 
     if path == "/" {
         let qc = quarantine_count(&opts.spam_dir);
         let mut body = opts.stats.overview_cards(qc);
         body.push_str(&opts.stats.per_model_html());
-        body.push_str("<h2>Letzte Mails</h2>");
-        body.push_str(&opts.stats.recent_html());
-        body.push_str(&format!("<p><a href=\"{}\">Spam-Quarantäne browsen &rarr;</a></p>", href("/mails", qtoken(&query), &[])));
-        return resp("200 OK", "text/html; charset=utf-8", page("Milter-Stats", &body, qtoken(&query), LIVE_JS).as_bytes());
+        body.push_str("<h2>Recent mails</h2>");
+        body.push_str(&opts.stats.recent_html(scr));
+        body.push_str(&format!("<p><a href=\"{}\">Browse spam quarantine &rarr;</a></p>", href_q("/mails", &query, &[])));
+        let script = format!("<script>const SCRAMBLE={};</script>{LIVE_JS}", if scr { "true" } else { "false" });
+        return resp("200 OK", "text/html; charset=utf-8", page("Milter-Stats", &body, &query, &script, scr, "/").as_bytes());
     }
     if path == "/api/stats" {
         let qc = quarantine_count(&opts.spam_dir);
-        let body = serde_json::to_string(&opts.stats.snapshot_json(qc)).unwrap_or_default();
+        let mut snap = opts.stats.snapshot_json(qc);
+        if scr {
+            if let Some(arr) = snap.get_mut("recent").and_then(|r| r.as_array_mut()) {
+                for r in arr.iter_mut() {
+                    r["sender"] = serde_json::Value::String("•••@•••".into());
+                }
+            }
+        }
+        let body = serde_json::to_string(&snap).unwrap_or_default();
         return resp("200 OK", "application/json", body.as_bytes());
     }
     if path == "/mails" || path == "/mails/" || path == "/api/mails" {
@@ -617,47 +743,48 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
                 "total": total, "limit": limit, "offset": offset,
                 "items": items.iter().map(|m| serde_json::json!({
                     "stem": m.stem, "mtime_unix": m.mtime_unix, "size": m.size,
-                    "sender": m.sender, "spam": m.spam, "summary": m.summary,
+                    "sender": if scr { "•••@•••" } else { &m.sender },
+                    "spam": m.spam, "verdict": m.verdict, "summary": m.summary, "models": m.models,
                 })).collect::<Vec<_>>(),
             }))
             .unwrap_or_default();
             return resp("200 OK", "application/json", body.as_bytes());
         }
+        let scr_cls = if scr { " class=\"scr\"" } else { "" };
         let mut body = format!(
-            "<form method=get action=\"{}\"><input type=text name=q placeholder=\"Suche (Sender/Dateiname)\" value=\"{}\">{}\
-            <button>Suchen</button></form><p>{} Treffer (zeige {} ab {})</p>",
-            href("/mails", "", &[]),
+            "<form method=get action=\"{}\"><input type=text name=q placeholder=\"Search (sender/filename)\" value=\"{}\"{scr_cls}>{}\
+            <button>Search</button></form><p>{} matches (showing {} from {})</p>",
+            href_q("/mails", &HashMap::new(), &[]),
             html_escape(&q),
-            if qtoken(&query).is_empty() { String::new() } else {
-                format!("<input type=hidden name=token value=\"{}\">", html_escape(qtoken(&query)))
-            },
+            hidden_keep(&query),
             total,
             items.len(),
             offset
         );
-        body.push_str("<table><tr><th>Datum</th><th>Datei</th><th>Sender</th><th>Verdict</th><th>Modelle</th></tr>");
+        body.push_str("<table><tr><th>Date</th><th>File</th><th>Sender</th><th>Verdict</th><th>Models</th></tr>");
         for m in &items {
             let dt = chrono::DateTime::from_timestamp(m.mtime_unix as i64, 0)
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| "-".into());
-            let verdict = match m.spam { Some(true) => "<span class=\"badge s\">SPAM</span>", Some(false) => "<span class=\"badge h\">ham</span>", None => "-" };
+            let detail = if m.models.is_empty() { html_escape(&m.summary) } else { chips_html(&m.models) };
             body.push_str(&format!(
-                "<tr><td>{dt}</td><td><a href=\"{}\">{}</a> ({} KB)</td><td>{}</td><td>{verdict}</td><td>{}</td></tr>",
-                href(&format!("/mails/{}", url_encode(&m.stem)), qtoken(&query), &[]),
+                "<tr><td>{dt}</td><td><a href=\"{}\">{}</a> ({} KB)</td><td{scr_cls}>{}</td><td>{}</td><td>{}</td></tr>",
+                href_q(&format!("/mails/{}", url_encode(&m.stem)), &query, &[]),
                 html_escape(&m.stem),
                 m.size / 1024,
                 html_escape(&m.sender),
-                html_escape(&m.summary)
+                mail_badge(m),
+                detail
             ));
         }
         body.push_str("</table>");
         if total > offset + items.len() {
             body.push_str(&format!(
-                "<p class=pager><a href=\"{}\">nächste &rarr;</a></p>",
-                href("/mails", qtoken(&query), &[("q", &q), ("limit", &limit.to_string()), ("offset", &(offset + items.len()).to_string())]),
+                "<p class=pager><a href=\"{}\">next &rarr;</a></p>",
+                href_q("/mails", &query, &[("q", &q), ("limit", &limit.to_string()), ("offset", &(offset + items.len()).to_string())]),
             ));
         }
-        return resp("200 OK", "text/html; charset=utf-8", page("Spam-Quarantäne", &body, qtoken(&query), "").as_bytes());
+        return resp("200 OK", "text/html; charset=utf-8", page("Spam quarantine", &body, &query, "", scr, "/mails").as_bytes());
     }
     if let Some(stem) = path.strip_prefix("/mails/") {
         let (stem, raw) = match stem.strip_suffix("/raw") {
@@ -672,18 +799,28 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
                 return resp("200 OK", "text/plain; charset=utf-8", eml.as_bytes());
             }
             Some((meta, eml)) => {
+                let sender = serde_json::from_str::<serde_json::Value>(&meta)
+                    .ok()
+                    .and_then(|v| v.get("envelope_from").and_then(|x| x.as_str()).map(str::to_string))
+                    .unwrap_or_default();
                 let pretty = serde_json::from_str::<serde_json::Value>(&meta)
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or(meta.clone()))
                     .unwrap_or(meta);
+                let (pretty, eml) = if scr {
+                    (redact_sender(&pretty, &sender), redact_sender(&eml, &sender))
+                } else {
+                    (pretty, eml)
+                };
+                let here = format!("/mails/{}", url_encode(&stem));
                 let body = format!(
-                    "<p><a href=\"{}\">&larr; zurück</a> &middot; <a href=\"{}\">raw .eml</a></p>\
+                    "<p><a href=\"{}\">&larr; back</a> &middot; <a href=\"{}\">raw .eml</a></p>\
                     <h2>Meta</h2><pre>{}</pre><h2>Mail</h2><pre>{}</pre>",
-                    href("/mails", qtoken(&query), &[]),
-                    href(&format!("/mails/{}/raw", url_encode(&stem)), qtoken(&query), &[]),
+                    href_q("/mails", &query, &[]),
+                    href_q(&format!("{here}/raw"), &query, &[]),
                     html_escape(&pretty),
                     html_escape(&eml)
                 );
-                return resp("200 OK", "text/html; charset=utf-8", page(&stem, &body, qtoken(&query), "").as_bytes());
+                return resp("200 OK", "text/html; charset=utf-8", page(&stem, &body, &query, "", scr, &here).as_bytes());
             }
             None => return resp("404 Not Found", "text/plain", b"mail not found"),
         }
@@ -771,7 +908,7 @@ mod tests {
 
     #[test]
     fn head_returns_headers_only() {
-        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None };
+        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None, scramble_senders: false };
         let get = handle_request("GET /api/stats HTTP/1.1\r\n\r\n", &opts);
         let head = handle_request("HEAD /api/stats HTTP/1.1\r\n\r\n", &opts);
         assert!(get.windows(4).any(|w| w == b"\r\n\r\n"));
@@ -794,7 +931,7 @@ mod tests {
     fn stats_record_counts() {
         let s = Stats::new();
         s.record(
-            RecentEntry { ts: "t".into(), queue_id: "q".into(), sender: "a@x".into(), spam: true, whitelisted: false, temperror: false, summary: "s".into() },
+            RecentEntry { ts: "t".into(), queue_id: "q".into(), sender: "a@x".into(), spam: true, whitelisted: false, temperror: false, summary: "s".into(), models: Vec::new() },
             &[("m".into(), true, 0.9, 10, Some(0.001), false)],
         );
         let v = s.snapshot_json(0);
@@ -820,24 +957,81 @@ mod tests {
     }
 
     #[test]
-    fn href_preserves_token() {        assert_eq!(href("/mails", "", &[]), "/mails");
-        assert_eq!(href("/mails", "s3cret", &[]), "/mails?token=s3cret");
+    fn href_q_keeps_and_overrides() {
+        let q = parse_query("token=s3cret&scramble=1");
+        assert_eq!(href_q("/mails", &q, &[]), "/mails?token=s3cret&scramble=1");
+        assert_eq!(href_q("/mails", &q, &[("scramble", "0")]), "/mails?token=s3cret&scramble=0");
         assert_eq!(
-            href("/mails", "a b", &[("q", "x@y"), ("offset", "10")]),
+            href_q("/mails", &parse_query("token=a%20b"), &[("q", "x@y"), ("offset", "10")]),
             "/mails?token=a%20b&q=x%40y&offset=10"
         );
+        assert_eq!(href_q("/mails", &parse_query(""), &[]), "/mails");
+    }
+
+    #[test]
+    fn scramble_effective_and_rendered() {
+        assert!(eff_scramble(&parse_query("scramble=1"), false));
+        assert!(!eff_scramble(&parse_query("scramble=0"), true));
+        assert!(eff_scramble(&parse_query(""), true));
+        assert!(!eff_scramble(&parse_query("scramble=bogus"), false));
+        assert_eq!(redact_sender("From: a@x, cc a@x", "a@x"), "From: •••@•••, cc •••@•••");
+        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None, scramble_senders: false };
+        let raw = handle_request("GET / HTTP/1.1\r\n\r\n", &opts);
+        let plain = String::from_utf8_lossy(&raw);
+        assert!(plain.contains("const SCRAMBLE=false;"));
+        assert!(plain.contains("Scramble: off"));
+        let raw_scr = handle_request("GET /?scramble=1 HTTP/1.1\r\n\r\n", &opts);
+        let scr = String::from_utf8_lossy(&raw_scr);
+        assert!(scr.contains("Scramble: on"));
+        assert!(scr.contains("const SCRAMBLE=true;"));
+    }
+
+    #[test]
+    fn sidecar_verdict_badge() {        let wl = QuarantineMail { stem: "x".into(), mtime_unix: 0, size: 0, sender: String::new(), spam: None, verdict: Some("whitelisted".into()), summary: String::new(), models: Vec::new() };
+        assert!(mail_badge(&wl).contains("whitelisted"));
+        let legacy_spam = QuarantineMail { stem: "x".into(), mtime_unix: 0, size: 0, sender: String::new(), spam: Some(true), verdict: None, summary: String::new(), models: Vec::new() };
+        assert!(mail_badge(&legacy_spam).contains("SPAM"));
+        // stored verdict wins over derived flag
+        let mixed = QuarantineMail { stem: "x".into(), mtime_unix: 0, size: 0, sender: String::new(), spam: Some(true), verdict: Some("ham".into()), summary: String::new(), models: Vec::new() };
+        assert!(mail_badge(&mixed).contains(">ham<"));
+    }
+
+    #[test]
+    fn chips_rendering() {
+        assert_eq!(short_model("typesafe/jev-1.13"), "jev-1.13");
+        assert_eq!(short_model("plain"), "plain");
+        let chips = vec![
+            ModelChip { name: "jev-1.13".into(), spam: true, err: false, score: 0.956 },
+            ModelChip { name: "clef-omni".into(), spam: false, err: false, score: 0.1 },
+            ModelChip { name: "m3".into(), spam: false, err: true, score: 0.0 },
+        ];
+        let h = chips_html(&chips);
+        assert!(h.contains("class=\"chip s\""));
+        assert!(h.contains("jev-1.13 · SPAM 0.96"));
+        assert!(h.contains("class=\"chip h\""));
+        assert!(h.contains("clef-omni · ham 0.10"));
+        assert!(h.contains("m3 · err"));
+        // record() attaches chips to the entry
+        let s = Stats::new();
+        s.record(
+            RecentEntry { ts: "t".into(), queue_id: "q".into(), sender: "a@x".into(), spam: true, whitelisted: false, temperror: false, summary: "s".into(), models: Vec::new() },
+            &[("org/jev-1.13".into(), true, 0.9, 10, None, false)],
+        );
+        let v = s.snapshot_json(0);
+        assert_eq!(v["recent"][0]["models"][0]["name"], "jev-1.13");
+        assert_eq!(v["recent"][0]["models"][0]["spam"], true);
     }
 
     #[test]
     fn index_page_is_live() {
-        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None };
+        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None, scramble_senders: false };
         let out = handle_request("GET / HTTP/1.1\r\n\r\n", &opts);
         let body = String::from_utf8_lossy(&out);
         assert!(body.contains("id=\"c-total\""));
         assert!(body.contains("id=\"m-models\""));
         assert!(body.contains("setInterval(tick, 3000)"));
         // with token auth, nav keeps ?token=
-        let opts_t = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: Some("s".into()) };
+        let opts_t = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: Some("s".into()), scramble_senders: false };
         let out = handle_request("GET /?token=s HTTP/1.1\r\n\r\n", &opts_t);
         let body = String::from_utf8_lossy(&out);
         assert!(body.contains("/mails?token=s"));

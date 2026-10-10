@@ -51,3 +51,5 @@ listen = "127.0.0.1:8892"   # interface + port. Examples: "127.0.0.1:8892" (loca
                              # WireGuard already encrypts). Avoid "0.0.0.0" unless behind a reverse proxy.
 # token = "s3cret"           # if set, required as ?token= or `Authorization: Bearer`
                              # keep it, even on a tailnet (shared network) — quarantine contains PII!
+# scramble_senders = false   # blur sender addresses in the web view (CSS) for safe screenshots;
+                             # also toggleable live via the "Scramble: an/aus" link (?scramble=1/0)

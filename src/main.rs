@@ -64,6 +64,7 @@ pub struct AppConfig {
     pub dashboard_enabled: bool,
     pub dashboard_listen: String, // own socket, e.g. 127.0.0.1:8892
     pub dashboard_token: Option<String>, // if set, required as ?token= or Bearer
+    pub dashboard_scramble_senders: bool, // blur sender addresses in HTML views
 }
 
 const DEFAULT_OPENROUTER_MODELS: &str = "microsoft/microsoft-decision-1,cloudflare/clef-omni,upstage/solar-decide-flash,nace-ai/drex-v1.5,typesafe/jev-1.13";
@@ -202,6 +203,7 @@ struct DashboardSection {
     enabled: Option<bool>,
     listen: Option<String>,
     token: Option<String>,
+    scramble_senders: Option<bool>,
 }
 
 fn config_path() -> String {
@@ -312,6 +314,7 @@ impl AppConfig {
             .or(dash.listen)
             .unwrap_or_else(|| "127.0.0.1:8892".into());
         let dashboard_token = env("DASHBOARD_TOKEN").or(dash.token).filter(|t| !t.is_empty());
+        let dashboard_scramble_senders = bool_val(env("DASHBOARD_SCRAMBLE_SENDERS"), dash.scramble_senders, false);
 
         Self {
             listen: env("MILTER_LISTEN").or(fc.listen).unwrap_or_else(|| "127.0.0.1:8891".into()),
@@ -341,6 +344,7 @@ impl AppConfig {
             dashboard_enabled,
             dashboard_listen,
             dashboard_token,
+            dashboard_scramble_senders,
         }
     }
 }
@@ -807,6 +811,7 @@ fn record_stats(
             } else {
                 verdict_tag(outcomes)
             },
+            models: Vec::new(), // filled by Stats::record from `models`
         },
         &models,
     );
@@ -865,6 +870,7 @@ async fn log_mail_eml(
 
     let meta = serde_json::json!({
         "queue_id": queue_id,
+        "verdict": tag, // "spam" | "ham" | "whitelisted" — used by the dashboard browser
         "outcomes": outcomes,
         "envelope_from": envelope_from,
         "envelope_rcpts": envelope_rcpts,
@@ -1047,6 +1053,7 @@ async fn main() -> std::io::Result<()> {
                 stats: dstats,
                 spam_dir: dcfg.log_spam_dir.clone(),
                 token: dcfg.dashboard_token.clone(),
+                scramble_senders: dcfg.dashboard_scramble_senders,
             };
             if let Err(e) = dashboard::serve(dcfg.dashboard_listen.clone(), opts).await {
                 warn!(error = %e, "dashboard failed");
@@ -1264,6 +1271,7 @@ mod tests {
             dashboard_enabled: false,
             dashboard_listen: "127.0.0.1:0".into(),
             dashboard_token: None,
+            dashboard_scramble_senders: false,
         }
     }
 
@@ -1440,6 +1448,7 @@ mod tests {
             enabled = true
             listen = "0.0.0.0:8892"
             token = "s3cret"
+            scramble_senders = true
             "#,
         )
         .unwrap();
@@ -1447,6 +1456,7 @@ mod tests {
         assert_eq!(d.enabled, Some(true));
         assert_eq!(d.listen.as_deref(), Some("0.0.0.0:8892"));
         assert_eq!(d.token.as_deref(), Some("s3cret"));
+        assert_eq!(d.scramble_senders, Some(true));
         // defaults: off
         let fc2: FileConfig = toml::from_str("").unwrap();
         assert!(fc2.dashboard.is_none());

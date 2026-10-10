@@ -110,6 +110,12 @@ Or via env: `DASHBOARD_ENABLED=true`, `DASHBOARD_LISTEN=127.0.0.1:8892`,
   search by sender/filename, detail view with meta + `.eml` preview + raw download.
 * `/api/stats`, `/api/mails`, `/api/mails/<stem>` — same as JSON.
 
+Sender addresses can be scrambled for shareable screenshots: `scramble_senders = true`
+(`DASHBOARD_SCRAMBLE_SENDERS`) blurs senders in the HTML views via CSS (cheap effect —
+DOM still contains them, so this is screenshot hygiene, not access control) and masks
+them as `•••@•••` in the JSON API. The `Scramble: an/aus` link (or `?scramble=1/0`)
+toggles it per request without a restart.
+
 Caution: the quarantine contains PII — keep it on `127.0.0.1` or behind a reverse
 proxy with auth; set `token` whenever the port isn't local-only. For Tailscale/Netbird:
 bind `listen` to the tailnet IP (e.g. `100.x.y.z:8892`) — HTTPS is unnecessary there

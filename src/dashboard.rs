@@ -64,6 +64,10 @@ pub struct RecentEntry {
     pub models: Vec<ModelChip>,
 }
 
+/// Flat outcome row handed to `Stats::record`:
+/// (model, is_spam, score, latency_ms, cost_usd, failed).
+pub type ModelRow = (String, bool, f32, u64, Option<f64>, bool);
+
 /// One model result for chip rendering (overview + quarantine list).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelChip {
@@ -75,7 +79,12 @@ pub struct ModelChip {
 
 /// "org/model-name…" -> "model-name…" (max 16 chars) for compact chips.
 fn short_model(name: &str) -> String {
-    name.split('/').next_back().unwrap_or(name).chars().take(16).collect()
+    name.split('/')
+        .next_back()
+        .unwrap_or(name)
+        .chars()
+        .take(16)
+        .collect()
 }
 
 fn chips_html(models: &[ModelChip]) -> String {
@@ -107,8 +116,8 @@ impl Stats {
         })
     }
 
-    /// Outcome row as recorded: (model, is_spam, score, latency_ms, cost, error?).
-    pub fn record(&self, mut entry: RecentEntry, models: &[(String, bool, f32, u64, Option<f64>, bool)]) {
+    /// Outcome row as recorded: see `ModelRow`.
+    pub fn record(&self, mut entry: RecentEntry, models: &[ModelRow]) {
         let mut g = match self.inner.write() {
             Ok(g) => g,
             Err(_) => return,
@@ -132,7 +141,8 @@ impl Stats {
                 err: *failed,
                 score: *score,
             });
-            let m = g.per_model.entry(name.clone()).or_default();            if *failed {
+            let m = g.per_model.entry(name.clone()).or_default();
+            if *failed {
                 m.errors += 1;
             } else {
                 m.ok += 1;
@@ -161,8 +171,16 @@ impl Stats {
             .per_model
             .iter()
             .map(|(name, m)| {
-                let avg_score = if m.ok > 0 { m.score_sum / m.ok as f64 } else { 0.0 };
-                let avg_lat = if m.ok > 0 { m.latency_ms_sum as f64 / m.ok as f64 } else { 0.0 };
+                let avg_score = if m.ok > 0 {
+                    m.score_sum / m.ok as f64
+                } else {
+                    0.0
+                };
+                let avg_lat = if m.ok > 0 {
+                    m.latency_ms_sum as f64 / m.ok as f64
+                } else {
+                    0.0
+                };
                 (
                     name.clone(),
                     serde_json::json!({
@@ -245,7 +263,11 @@ impl Stats {
 
     fn per_model_html(&self) -> String {
         let rows: Vec<(String, ModelStats)> = match self.inner.read() {
-            Ok(g) => g.per_model.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Ok(g) => g
+                .per_model
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             Err(_) => Vec::new(),
         };
         let mut h = String::from(
@@ -257,8 +279,16 @@ impl Stats {
         let mut rows = rows;
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, m) in rows {
-            let avg_s = if m.ok > 0 { m.score_sum / m.ok as f64 } else { 0.0 };
-            let avg_l = if m.ok > 0 { m.latency_ms_sum as f64 / m.ok as f64 } else { 0.0 };
+            let avg_s = if m.ok > 0 {
+                m.score_sum / m.ok as f64
+            } else {
+                0.0
+            };
+            let avg_l = if m.ok > 0 {
+                m.latency_ms_sum as f64 / m.ok as f64
+            } else {
+                0.0
+            };
             h.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.0}ms</td><td>{:.5}</td></tr>",
                 html_escape(&name),
@@ -290,15 +320,29 @@ pub struct QuarantineMail {
 }
 
 pub fn quarantine_count(dir: &Path) -> usize {
-    std::fs::read_dir(dir).map(|rd| rd.filter(|e| is_eml(e)).count()).unwrap_or(0)
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter(is_eml).count())
+        .unwrap_or(0)
 }
 
 fn is_eml(e: &std::io::Result<std::fs::DirEntry>) -> bool {
-    e.as_ref().map(|e| e.path().extension().map(|x| x.eq_ignore_ascii_case("eml")).unwrap_or(false)).unwrap_or(false)
+    e.as_ref()
+        .map(|e| {
+            e.path()
+                .extension()
+                .map(|x| x.eq_ignore_ascii_case("eml"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 /// List quarantined mails, newest first. `q` filters stem/sender substring (case-insensitive).
-pub fn list_quarantine(dir: &Path, q: &str, limit: usize, offset: usize) -> (Vec<QuarantineMail>, usize) {
+pub fn list_quarantine(
+    dir: &Path,
+    q: &str,
+    limit: usize,
+    offset: usize,
+) -> (Vec<QuarantineMail>, usize) {
     let mut all: Vec<QuarantineMail> = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -306,40 +350,82 @@ pub fn list_quarantine(dir: &Path, q: &str, limit: usize, offset: usize) -> (Vec
     };
     for e in rd.flatten() {
         let path = e.path();
-        if path.extension().map(|x| !x.eq_ignore_ascii_case("eml")).unwrap_or(true) {
+        if path
+            .extension()
+            .map(|x| !x.eq_ignore_ascii_case("eml"))
+            .unwrap_or(true)
+        {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         if stem.is_empty() {
             continue;
         }
         let (mtime_unix, size) = e
             .metadata()
             .map(|m| {
-                let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 (t, m.len())
             })
             .unwrap_or((0, 0));
         let (sender, spam, verdict, summary, models) = read_sidecar_json(dir, &stem);
-        all.push(QuarantineMail { stem, mtime_unix, size, sender, spam, verdict, summary, models });
+        all.push(QuarantineMail {
+            stem,
+            mtime_unix,
+            size,
+            sender,
+            spam,
+            verdict,
+            summary,
+            models,
+        });
     }
     all.sort_by(|a, b| b.mtime_unix.cmp(&a.mtime_unix).then(a.stem.cmp(&b.stem)));
     if !q.is_empty() {
         let ql = q.to_lowercase();
-        all.retain(|m| m.stem.to_lowercase().contains(&ql) || m.sender.to_lowercase().contains(&ql));
+        all.retain(|m| {
+            m.stem.to_lowercase().contains(&ql) || m.sender.to_lowercase().contains(&ql)
+        });
     }
     let total = all.len();
     let items = all.into_iter().skip(offset).take(limit.min(500)).collect();
     (items, total)
 }
 
-fn read_sidecar_json(dir: &Path, stem: &str) -> (String, Option<bool>, Option<String>, String, Vec<ModelChip>) {
+fn read_sidecar_json(
+    dir: &Path,
+    stem: &str,
+) -> (String, Option<bool>, Option<String>, String, Vec<ModelChip>) {
     let empty = || (String::new(), None, None, String::new(), Vec::new());
-    let Ok(s) = std::fs::read_to_string(dir.join(format!("{stem}.json"))) else { return empty() };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else { return empty() };
-    let sender = v.get("envelope_from").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let verdict = v.get("verdict").and_then(|x| x.as_str()).map(str::to_string);
-    let outcomes = v.get("outcomes").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let Ok(s) = std::fs::read_to_string(dir.join(format!("{stem}.json"))) else {
+        return empty();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return empty();
+    };
+    let sender = v
+        .get("envelope_from")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let verdict = v
+        .get("verdict")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    let outcomes = v
+        .get("outcomes")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     let models: Vec<ModelChip> = outcomes
         .iter()
         .take(8)
@@ -349,7 +435,11 @@ fn read_sidecar_json(dir: &Path, stem: &str) -> (String, Option<bool>, Option<St
                 name: short_model(model),
                 spam: o.get("is_spam").and_then(|x| x.as_bool()).unwrap_or(false),
                 err: o.get("error").and_then(|x| x.as_str()).is_some(),
-                score: o.get("verdict").and_then(|x| x.get("score")).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                score: o
+                    .get("verdict")
+                    .and_then(|x| x.get("score"))
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0) as f32,
             }
         })
         .collect();
@@ -359,12 +449,21 @@ fn read_sidecar_json(dir: &Path, stem: &str) -> (String, Option<bool>, Option<St
         if m.err {
             parts.push(format!("{}=err", m.name));
         } else {
-            parts.push(format!("{}={}:{:.2}", m.name, if m.spam { "spam" } else { "ham" }, m.score));
+            parts.push(format!(
+                "{}={}:{:.2}",
+                m.name,
+                if m.spam { "spam" } else { "ham" },
+                m.score
+            ));
         }
     }
     let summary: String = parts.join(" | ").chars().take(160).collect();
     // spam flag is not stored in the sidecar; derive from outcomes when present.
-    let spam = if outcomes.is_empty() { None } else { Some(models.iter().any(|m| m.spam)) };
+    let spam = if outcomes.is_empty() {
+        None
+    } else {
+        Some(models.iter().any(|m| m.spam))
+    };
     (sender, spam, verdict, summary, models)
 }
 
@@ -373,7 +472,8 @@ pub fn read_mail(dir: &Path, stem: &str) -> Option<(String, String)> {
         return None;
     }
     let eml = std::fs::read(dir.join(format!("{stem}.eml"))).ok()?;
-    let meta = std::fs::read_to_string(dir.join(format!("{stem}.json"))).unwrap_or_else(|_| "{}".into());
+    let meta =
+        std::fs::read_to_string(dir.join(format!("{stem}.json"))).unwrap_or_else(|_| "{}".into());
     // Cap preview at ~200KB so a huge mail doesn't blow up the page.
     let text = String::from_utf8_lossy(&eml[..eml.len().min(200_000)]).into_owned();
     Some((meta, text))
@@ -420,7 +520,9 @@ fn url_encode(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
             _ => o.push_str(&format!("%{b:02X}")),
         }
     }
@@ -561,7 +663,11 @@ fn href_q(base: &str, query: &HashMap<String, String>, params: &[(&str, &str)]) 
     for (k, v) in params {
         q.push(format!("{k}={}", url_encode(v)));
     }
-    if q.is_empty() { base.to_string() } else { format!("{base}?{}", q.join("&")) }
+    if q.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", q.join("&"))
+    }
 }
 
 /// Hidden form fields carrying token/scramble through GET forms.
@@ -569,7 +675,10 @@ fn hidden_keep(query: &HashMap<String, String>) -> String {
     let mut h = String::new();
     for key in ["token", "scramble"] {
         if let Some(v) = query.get(key) {
-            h.push_str(&format!("<input type=hidden name={key} value=\"{}\">", html_escape(v)));
+            h.push_str(&format!(
+                "<input type=hidden name={key} value=\"{}\">",
+                html_escape(v)
+            ));
         }
     }
     h
@@ -619,7 +728,14 @@ fn verdict_badge(whitelisted: bool, temperror: bool, spam: bool) -> &'static str
     }
 }
 
-fn page(title: &str, body: &str, query: &HashMap<String, String>, script: &str, scr: bool, here: &str) -> String {
+fn page(
+    title: &str,
+    body: &str,
+    query: &HashMap<String, String>,
+    script: &str,
+    scr: bool,
+    here: &str,
+) -> String {
     let toggle = if scr { "0" } else { "1" };
     let nav = format!(
         "<nav class=top><a href=\"{}\">Stats</a><a href=\"{}\">Quarantine</a><span class=sp></span>\
@@ -694,14 +810,25 @@ fn handle_request(req: &str, opts: &DashboardOpts) -> Vec<u8> {
 
 fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
     let mut lines = req.lines();
-    let request_line = lines.next().unwrap_or("").trim_end_matches('\r').to_string();
+    let request_line = lines
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\r')
+        .to_string();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
     if method != "GET" && method != "HEAD" {
-        return resp("405 Method Not Allowed", "text/plain", b"only GET supported");
+        return resp(
+            "405 Method Not Allowed",
+            "text/plain",
+            b"only GET supported",
+        );
     }
-    let (path, qs) = match target.split_once('?') { Some((p, q)) => (p, q), None => (target, "") };
+    let (path, qs) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
     let query = parse_query(qs);
     if !authorized(req, &query, &opts.token) {
         return resp("401 Unauthorized", "text/plain", b"missing or wrong token");
@@ -716,9 +843,19 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
         body.push_str(&opts.stats.per_model_html());
         body.push_str("<h2>Recent mails</h2>");
         body.push_str(&opts.stats.recent_html(scr));
-        body.push_str(&format!("<p><a href=\"{}\">Browse spam quarantine &rarr;</a></p>", href_q("/mails", &query, &[])));
-        let script = format!("<script>const SCRAMBLE={};</script>{LIVE_JS}", if scr { "true" } else { "false" });
-        return resp("200 OK", "text/html; charset=utf-8", page("Milter-Stats", &body, &query, &script, scr, "/").as_bytes());
+        body.push_str(&format!(
+            "<p><a href=\"{}\">Browse spam quarantine &rarr;</a></p>",
+            href_q("/mails", &query, &[])
+        ));
+        let script = format!(
+            "<script>const SCRAMBLE={};</script>{LIVE_JS}",
+            if scr { "true" } else { "false" }
+        );
+        return resp(
+            "200 OK",
+            "text/html; charset=utf-8",
+            page("Milter-Stats", &body, &query, &script, scr, "/").as_bytes(),
+        );
     }
     if path == "/api/stats" {
         let qc = quarantine_count(&opts.spam_dir);
@@ -766,7 +903,11 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
             let dt = chrono::DateTime::from_timestamp(m.mtime_unix as i64, 0)
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| "-".into());
-            let detail = if m.models.is_empty() { html_escape(&m.summary) } else { chips_html(&m.models) };
+            let detail = if m.models.is_empty() {
+                html_escape(&m.summary)
+            } else {
+                chips_html(&m.models)
+            };
             body.push_str(&format!(
                 "<tr><td>{dt}</td><td><a href=\"{}\">{}</a> ({} KB)</td><td{scr_cls}>{}</td><td>{}</td><td>{}</td></tr>",
                 href_q(&format!("/mails/{}", url_encode(&m.stem)), &query, &[]),
@@ -781,10 +922,22 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
         if total > offset + items.len() {
             body.push_str(&format!(
                 "<p class=pager><a href=\"{}\">next &rarr;</a></p>",
-                href_q("/mails", &query, &[("q", &q), ("limit", &limit.to_string()), ("offset", &(offset + items.len()).to_string())]),
+                href_q(
+                    "/mails",
+                    &query,
+                    &[
+                        ("q", &q),
+                        ("limit", &limit.to_string()),
+                        ("offset", &(offset + items.len()).to_string())
+                    ]
+                ),
             ));
         }
-        return resp("200 OK", "text/html; charset=utf-8", page("Spam quarantine", &body, &query, "", scr, "/mails").as_bytes());
+        return resp(
+            "200 OK",
+            "text/html; charset=utf-8",
+            page("Spam quarantine", &body, &query, "", scr, "/mails").as_bytes(),
+        );
     }
     if let Some(stem) = path.strip_prefix("/mails/") {
         let (stem, raw) = match stem.strip_suffix("/raw") {
@@ -801,13 +954,20 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
             Some((meta, eml)) => {
                 let sender = serde_json::from_str::<serde_json::Value>(&meta)
                     .ok()
-                    .and_then(|v| v.get("envelope_from").and_then(|x| x.as_str()).map(str::to_string))
+                    .and_then(|v| {
+                        v.get("envelope_from")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string)
+                    })
                     .unwrap_or_default();
                 let pretty = serde_json::from_str::<serde_json::Value>(&meta)
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or(meta.clone()))
                     .unwrap_or(meta);
                 let (pretty, eml) = if scr {
-                    (redact_sender(&pretty, &sender), redact_sender(&eml, &sender))
+                    (
+                        redact_sender(&pretty, &sender),
+                        redact_sender(&eml, &sender),
+                    )
                 } else {
                     (pretty, eml)
                 };
@@ -820,31 +980,46 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
                     html_escape(&pretty),
                     html_escape(&eml)
                 );
-                return resp("200 OK", "text/html; charset=utf-8", page(&stem, &body, &query, "", scr, &here).as_bytes());
+                return resp(
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    page(&stem, &body, &query, "", scr, &here).as_bytes(),
+                );
             }
             None => return resp("404 Not Found", "text/plain", b"mail not found"),
         }
     }
     if let Some(stem) = path.strip_prefix("/api/mails/") {
         if stem.is_empty() || stem.contains('/') {
-            return resp("404 Not Found", "application/json", br#"{"error":"not found"}"#);
+            return resp(
+                "404 Not Found",
+                "application/json",
+                br#"{"error":"not found"}"#,
+            );
         }
         match read_mail(&opts.spam_dir, stem) {
             Some((meta, eml)) => {
-                let meta_v: serde_json::Value = serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
-                let body = serde_json::to_string(&serde_json::json!({"stem": stem, "meta": meta_v, "eml": eml})).unwrap_or_default();
+                let meta_v: serde_json::Value =
+                    serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
+                let body = serde_json::to_string(
+                    &serde_json::json!({"stem": stem, "meta": meta_v, "eml": eml}),
+                )
+                .unwrap_or_default();
                 return resp("200 OK", "application/json", body.as_bytes());
             }
-            None => return resp("404 Not Found", "application/json", br#"{"error":"not found"}"#),
+            None => {
+                return resp(
+                    "404 Not Found",
+                    "application/json",
+                    br#"{"error":"not found"}"#,
+                )
+            }
         }
     }
     resp("404 Not Found", "text/plain", b"not found")
 }
 
-pub async fn serve(
-    listen: String,
-    opts: DashboardOpts,
-) -> std::io::Result<()> {
+pub async fn serve(listen: String, opts: DashboardOpts) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(listen = %listen, "dashboard listening");
     let opts = Arc::new(opts);
@@ -888,6 +1063,76 @@ pub async fn serve(
 mod tests {
     use super::*;
 
+    /// Minimal temp dir helper (no `tempfile` dependency): returns a unique
+    /// path that is removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "aim-dash-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            TempDir(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn write(&self, name: &str, body: &str) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, body).expect("write temp file");
+            p
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn opts_for(dir: &Path, token: Option<&str>, scramble: bool) -> DashboardOpts {
+        DashboardOpts {
+            stats: Stats::new(),
+            spam_dir: dir.to_path_buf(),
+            token: token.map(str::to_string),
+            scramble_senders: scramble,
+        }
+    }
+
+    /// GET a route and split the response into (status_line, body).
+    fn get(opts: &DashboardOpts, target: &str) -> (String, String) {
+        let out = handle_request(&format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n"), opts);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+        let status = head.lines().next().unwrap_or("").to_string();
+        (status, body.to_string())
+    }
+
+    fn quarantine_with_two_mails() -> TempDir {
+        let td = TempDir::new("quarantine");
+        td.write(
+            "20240101T000000_q1_spam.eml",
+            "From: spammer@evil.com\r\nSubject: win\r\n\r\nbody",
+        );
+        td.write(
+            "20240101T000000_q1_spam.json",
+            r#"{"queue_id":"q1","verdict":"spam","envelope_from":"spammer@evil.com",
+                "outcomes":[{"model":"typesafe/jev-1.13","is_spam":true,
+                             "verdict":{"spam":true,"score":0.95,"reason":"bulk"},"latency_ms":42}]}"#,
+        );
+        td.write(
+            "20240102T000000_q2_whitelisted.eml",
+            "From: boss@example.com\r\nSubject: hi\r\n\r\nlegit",
+        );
+        td.write(
+            "20240102T000000_q2_whitelisted.json",
+            r#"{"queue_id":"q2","verdict":"whitelisted","envelope_from":"boss@example.com","outcomes":[]}"#,
+        );
+        td
+    }
+
     #[test]
     fn html_escape_basic() {
         assert_eq!(html_escape("<b>&\"</b>"), "&lt;b&gt;&amp;&quot;&lt;/b&gt;");
@@ -908,16 +1153,25 @@ mod tests {
 
     #[test]
     fn head_returns_headers_only() {
-        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None, scramble_senders: false };
+        let opts = DashboardOpts {
+            stats: Stats::new(),
+            spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
+            token: None,
+            scramble_senders: false,
+        };
         let get = handle_request("GET /api/stats HTTP/1.1\r\n\r\n", &opts);
         let head = handle_request("HEAD /api/stats HTTP/1.1\r\n\r\n", &opts);
         assert!(get.windows(4).any(|w| w == b"\r\n\r\n"));
         let hdr_end = get.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert_eq!(&head[..], &get[..hdr_end]); // same headers, no body
-        // case-insensitive Authorization header
+                                                // case-insensitive Authorization header
         let tok = Some("s".to_string());
         let q = parse_query("");
-        assert!(authorized("GET / HTTP/1.1\r\nAUTHORIZATION: Bearer s\r\n\r\n", &q, &tok));
+        assert!(authorized(
+            "GET / HTTP/1.1\r\nAUTHORIZATION: Bearer s\r\n\r\n",
+            &q,
+            &tok
+        ));
     }
 
     #[test]
@@ -925,13 +1179,288 @@ mod tests {
         let dir = Path::new("/tmp/does-not-exist-xyz");
         assert!(read_mail(dir, "../evil").is_none());
         assert!(read_mail(dir, "a/b").is_none());
+        assert!(read_mail(dir, "a\\b").is_none());
+        assert!(read_mail(dir, "..").is_none());
+    }
+
+    #[test]
+    fn list_quarantine_lists_newest_first_with_meta() {
+        let td = quarantine_with_two_mails();
+        let (items, total) = list_quarantine(td.path(), "", 100, 0);
+        assert_eq!(total, 2);
+        // mtime ties are broken by stem, both files exist -> both returned
+        assert_eq!(items.len(), 2);
+        let spam = items.iter().find(|m| m.stem.contains("q1")).unwrap();
+        assert_eq!(spam.sender, "spammer@evil.com");
+        assert_eq!(spam.verdict.as_deref(), Some("spam"));
+        assert_eq!(spam.spam, Some(true));
+        assert_eq!(spam.models.len(), 1);
+        assert_eq!(spam.models[0].name, "jev-1.13"); // shortened from typesafe/jev-1.13
+        assert!(spam.models[0].spam);
+        assert!(spam.summary.contains("SPAM") || spam.summary.contains("spam"));
+
+        let wl = items.iter().find(|m| m.stem.contains("q2")).unwrap();
+        assert_eq!(wl.verdict.as_deref(), Some("whitelisted"));
+        assert_eq!(wl.spam, None, "no outcomes -> no derived spam flag");
+        assert!(wl.models.is_empty());
+    }
+
+    #[test]
+    fn list_quarantine_search_and_paging() {
+        let td = quarantine_with_two_mails();
+        // case-insensitive sender / stem search
+        let (items, total) = list_quarantine(td.path(), "EVIL", 100, 0);
+        assert_eq!(total, 1);
+        assert!(items[0].stem.contains("q1"));
+        assert_eq!(list_quarantine(td.path(), "nomatch", 100, 0).1, 0);
+        // paging
+        let (page, total) = list_quarantine(td.path(), "", 1, 1);
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 1);
+        // limit is capped at 500
+        assert_eq!(list_quarantine(td.path(), "", 10_000, 0).0.len(), 2);
+        // non-eml files are ignored
+        td.write("notes.txt", "ignore me");
+        assert_eq!(list_quarantine(td.path(), "", 100, 0).1, 2);
+        assert_eq!(quarantine_count(td.path()), 2);
+    }
+
+    #[test]
+    fn sidecar_json_edge_cases() {
+        let td = TempDir::new("sidecar");
+        // missing file
+        assert_eq!(read_sidecar_json(td.path(), "nope").0, "");
+        // invalid json
+        td.write("bad.json", "{not json");
+        let (sender, spam, verdict, _summary, models) = read_sidecar_json(td.path(), "bad");
+        assert!(sender.is_empty() && spam.is_none() && verdict.is_none() && models.is_empty());
+        // error outcome renders as err chip
+        td.write(
+            "err.json",
+            r#"{"envelope_from":"a@b","outcomes":[{"model":"m1","is_spam":false,
+                "error":"timeout","latency_ms":5000}]}"#,
+        );
+        let (_, _, _, summary, models) = read_sidecar_json(td.path(), "err");
+        assert!(models[0].err);
+        assert!(summary.contains("err"));
+    }
+
+    #[test]
+    fn read_mail_returns_meta_and_body() {
+        let td = quarantine_with_two_mails();
+        let (meta, eml) = read_mail(td.path(), "20240101T000000_q1_spam").unwrap();
+        assert!(meta.contains("spammer@evil.com"));
+        assert!(eml.contains("Subject: win"));
+        assert!(read_mail(td.path(), "does-not-exist").is_none());
+    }
+
+    #[test]
+    fn route_mails_lists_quarantine() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), None, false);
+        let (status, body) = get(&opts, "/mails");
+        assert!(status.contains("200"));
+        assert!(body.contains("spammer@evil.com"));
+        assert!(body.contains("boss@example.com"));
+        assert!(body.contains("badge s"), "spam badge");
+        assert!(body.contains("badge w"), "whitelisted badge");
+        assert!(body.contains("chip"), "model chips rendered");
+        assert!(body.contains("Search (sender/filename)"));
+        // link to detail view
+        assert!(body.contains("/mails/20240101T000000_q1_spam"));
+    }
+
+    #[test]
+    fn route_mails_search_and_paging_html() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), None, false);
+        let (status, body) = get(&opts, "/mails?q=evil");
+        assert!(status.contains("200"));
+        assert!(body.contains("spammer@evil.com"));
+        assert!(!body.contains("boss@example.com"), "filtered out");
+        assert!(body.contains("1 matches"));
+        // paging link appears when more remain
+        let (_, body) = get(&opts, "/mails?limit=1");
+        assert!(body.contains("next"));
+        // trailing slash works
+        assert!(get(&opts, "/mails/").0.contains("200"));
+    }
+
+    #[test]
+    fn route_mails_detail_and_raw() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), None, false);
+        let (status, body) = get(&opts, "/mails/20240101T000000_q1_spam");
+        assert!(status.contains("200"));
+        assert!(body.contains("Subject: win"), "mail body preview");
+        assert!(body.contains("spammer@evil.com"), "meta json");
+        assert!(body.contains("raw .eml"));
+        // raw endpoint returns the eml
+        let (status, body) = get(&opts, "/mails/20240101T000000_q1_spam/raw");
+        assert!(status.contains("200"));
+        assert!(body.starts_with("From: spammer@evil.com"));
+        // missing mail -> 404
+        assert!(get(&opts, "/mails/nope").0.contains("404"));
+        assert!(get(&opts, "/mails/nope/raw").0.contains("404"));
+    }
+
+    #[test]
+    fn route_api_mails_json() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), None, false);
+        let (status, body) = get(&opts, "/api/mails");
+        assert!(status.contains("200"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+        let item = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["stem"] == "20240101T000000_q1_spam")
+            .unwrap();
+        assert_eq!(item["verdict"], "spam");
+        assert_eq!(item["models"][0]["name"], "jev-1.13");
+        assert_eq!(item["models"][0]["spam"], true);
+        // detail json
+        let (status, body) = get(&opts, "/api/mails/20240101T000000_q1_spam");
+        assert!(status.contains("200"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(v["meta"]["verdict"] == "spam");
+        assert!(v["eml"].as_str().unwrap().contains("Subject: win"));
+        assert!(get(&opts, "/api/mails/nope").0.contains("404"));
+    }
+
+    #[test]
+    fn route_errors_and_methods() {
+        let td = TempDir::new("routes");
+        let opts = opts_for(td.path(), None, false);
+        // unknown route
+        assert!(get(&opts, "/nope").0.contains("404"));
+        assert!(get(&opts, "/api/nope").0.contains("404"));
+        // non-GET
+        let out = handle_request("POST /api/stats HTTP/1.1\r\n\r\n", &opts);
+        assert!(String::from_utf8_lossy(&out).contains("405"));
+        // "/mails/" is the list route (200), not a mail detail lookup
+        assert!(get(&opts, "/mails/").0.contains("200"));
+        // nested path under a mail detail is rejected
+        assert!(get(&opts, "/mails/a/b").0.contains("404"));
+        // empty quarantine dir still renders
+        let (status, body) = get(&opts, "/mails");
+        assert!(status.contains("200"));
+        assert!(body.contains("0 matches"));
+        // missing dir -> treated as empty, not an error
+        let missing = opts_for(Path::new("/tmp/does-not-exist-xyz"), None, false);
+        assert!(get(&missing, "/mails").0.contains("200"));
+    }
+
+    #[test]
+    fn auth_gates_every_route() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), Some("t0k3n"), false);
+        for path in [
+            "/",
+            "/mails",
+            "/api/stats",
+            "/api/mails",
+            "/mails/20240101T000000_q1_spam",
+        ] {
+            assert!(get(&opts, path).0.contains("401"), "{path} must be gated");
+        }
+        // correct token passes
+        assert!(get(&opts, "/?token=t0k3n").0.contains("200"));
+        // wrong token fails
+        assert!(get(&opts, "/?token=wrong").0.contains("401"));
+    }
+
+    #[test]
+    fn scramble_masks_senders_in_html_and_json() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), None, true);
+
+        let (_, body) = get(&opts, "/mails");
+        assert!(body.contains("class=\"scr\""), "senders blurred");
+        assert!(body.contains("Scramble: on"));
+        // search input also blurred
+        assert!(body.contains("value=\"\" class=\"scr\""));
+
+        // detail view redacts the sender inside the <pre> blocks
+        let (_, body) = get(&opts, "/mails/20240101T000000_q1_spam");
+        assert!(
+            !body.contains("spammer@evil.com"),
+            "sender redacted in detail"
+        );
+        assert!(body.contains("•••@•••"));
+        assert!(body.contains("Subject: win"), "rest of the mail intact");
+
+        // json api masks senders
+        let (_, body) = get(&opts, "/api/mails");
+        assert!(!body.contains("spammer@evil.com"));
+        assert!(body.contains("•••@•••"));
+        // raw download is intentionally NOT redacted (explicit user action)
+        let (_, body) = get(&opts, "/mails/20240101T000000_q1_spam/raw");
+        assert!(body.contains("spammer@evil.com"));
+    }
+
+    #[test]
+    fn scramble_off_shows_plain_senders() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), None, false);
+        let (_, body) = get(&opts, "/mails");
+        assert!(!body.contains("class=\"scr\""));
+        assert!(body.contains("Scramble: off"));
+        let (_, body) = get(&opts, "/mails/20240101T000000_q1_spam");
+        assert!(body.contains("spammer@evil.com"));
+    }
+
+    #[test]
+    fn nav_preserves_token_across_pages() {
+        let td = quarantine_with_two_mails();
+        let opts = opts_for(td.path(), Some("t0k3n"), false);
+        // nav on the index keeps the token so navigation doesn't 401
+        let (_, body) = get(&opts, "/?token=t0k3n");
+        assert!(body.contains("/mails?token=t0k3n"));
+        assert!(body.contains("/api/stats?token=t0k3n"));
+        // search form carries it as a hidden field
+        let (_, body) = get(&opts, "/mails?token=t0k3n");
+        assert!(body.contains("<input type=hidden name=token value=\"t0k3n\">"));
+        // and the detail page too
+        let (_, body) = get(&opts, "/mails/20240101T000000_q1_spam?token=t0k3n");
+        assert!(body.contains("/mails?token=t0k3n"));
+    }
+
+    #[test]
+    fn html_output_is_escaped() {
+        let td = TempDir::new("xss");
+        // sender with HTML chars must not break out of the table cell
+        td.write("x.eml", "From: a@b\r\n\r\nbody");
+        td.write(
+            "x.json",
+            r#"{"verdict":"spam","envelope_from":"<script>alert(1)</script>","outcomes":[]}"#,
+        );
+        let opts = opts_for(td.path(), None, false);
+        let (_, body) = get(&opts, "/mails");
+        assert!(!body.contains("<script>alert(1)</script>"));
+        assert!(body.contains("&lt;script&gt;"));
+        // detail: raw .eml body is escaped too
+        let (_, body) = get(&opts, "/mails/x");
+        assert!(!body.contains("<script>alert(1)</script>"));
     }
 
     #[test]
     fn stats_record_counts() {
         let s = Stats::new();
         s.record(
-            RecentEntry { ts: "t".into(), queue_id: "q".into(), sender: "a@x".into(), spam: true, whitelisted: false, temperror: false, summary: "s".into(), models: Vec::new() },
+            RecentEntry {
+                ts: "t".into(),
+                queue_id: "q".into(),
+                sender: "a@x".into(),
+                spam: true,
+                whitelisted: false,
+                temperror: false,
+                summary: "s".into(),
+                models: Vec::new(),
+            },
             &[("m".into(), true, 0.9, 10, Some(0.001), false)],
         );
         let v = s.snapshot_json(0);
@@ -953,16 +1482,27 @@ mod tests {
         assert!(!authorized("GET / HTTP/1.1", &q, &tok));
         let q2 = parse_query("token=secret");
         assert!(authorized("GET /?token=secret HTTP/1.1", &q2, &tok));
-        assert!(authorized("GET / HTTP/1.1\nAuthorization: Bearer secret", &q, &tok));
+        assert!(authorized(
+            "GET / HTTP/1.1\nAuthorization: Bearer secret",
+            &q,
+            &tok
+        ));
     }
 
     #[test]
     fn href_q_keeps_and_overrides() {
         let q = parse_query("token=s3cret&scramble=1");
         assert_eq!(href_q("/mails", &q, &[]), "/mails?token=s3cret&scramble=1");
-        assert_eq!(href_q("/mails", &q, &[("scramble", "0")]), "/mails?token=s3cret&scramble=0");
         assert_eq!(
-            href_q("/mails", &parse_query("token=a%20b"), &[("q", "x@y"), ("offset", "10")]),
+            href_q("/mails", &q, &[("scramble", "0")]),
+            "/mails?token=s3cret&scramble=0"
+        );
+        assert_eq!(
+            href_q(
+                "/mails",
+                &parse_query("token=a%20b"),
+                &[("q", "x@y"), ("offset", "10")]
+            ),
             "/mails?token=a%20b&q=x%40y&offset=10"
         );
         assert_eq!(href_q("/mails", &parse_query(""), &[]), "/mails");
@@ -974,8 +1514,16 @@ mod tests {
         assert!(!eff_scramble(&parse_query("scramble=0"), true));
         assert!(eff_scramble(&parse_query(""), true));
         assert!(!eff_scramble(&parse_query("scramble=bogus"), false));
-        assert_eq!(redact_sender("From: a@x, cc a@x", "a@x"), "From: •••@•••, cc •••@•••");
-        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None, scramble_senders: false };
+        assert_eq!(
+            redact_sender("From: a@x, cc a@x", "a@x"),
+            "From: •••@•••, cc •••@•••"
+        );
+        let opts = DashboardOpts {
+            stats: Stats::new(),
+            spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
+            token: None,
+            scramble_senders: false,
+        };
         let raw = handle_request("GET / HTTP/1.1\r\n\r\n", &opts);
         let plain = String::from_utf8_lossy(&raw);
         assert!(plain.contains("const SCRAMBLE=false;"));
@@ -987,12 +1535,40 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_verdict_badge() {        let wl = QuarantineMail { stem: "x".into(), mtime_unix: 0, size: 0, sender: String::new(), spam: None, verdict: Some("whitelisted".into()), summary: String::new(), models: Vec::new() };
+    fn sidecar_verdict_badge() {
+        let wl = QuarantineMail {
+            stem: "x".into(),
+            mtime_unix: 0,
+            size: 0,
+            sender: String::new(),
+            spam: None,
+            verdict: Some("whitelisted".into()),
+            summary: String::new(),
+            models: Vec::new(),
+        };
         assert!(mail_badge(&wl).contains("whitelisted"));
-        let legacy_spam = QuarantineMail { stem: "x".into(), mtime_unix: 0, size: 0, sender: String::new(), spam: Some(true), verdict: None, summary: String::new(), models: Vec::new() };
+        let legacy_spam = QuarantineMail {
+            stem: "x".into(),
+            mtime_unix: 0,
+            size: 0,
+            sender: String::new(),
+            spam: Some(true),
+            verdict: None,
+            summary: String::new(),
+            models: Vec::new(),
+        };
         assert!(mail_badge(&legacy_spam).contains("SPAM"));
         // stored verdict wins over derived flag
-        let mixed = QuarantineMail { stem: "x".into(), mtime_unix: 0, size: 0, sender: String::new(), spam: Some(true), verdict: Some("ham".into()), summary: String::new(), models: Vec::new() };
+        let mixed = QuarantineMail {
+            stem: "x".into(),
+            mtime_unix: 0,
+            size: 0,
+            sender: String::new(),
+            spam: Some(true),
+            verdict: Some("ham".into()),
+            summary: String::new(),
+            models: Vec::new(),
+        };
         assert!(mail_badge(&mixed).contains(">ham<"));
     }
 
@@ -1001,9 +1577,24 @@ mod tests {
         assert_eq!(short_model("typesafe/jev-1.13"), "jev-1.13");
         assert_eq!(short_model("plain"), "plain");
         let chips = vec![
-            ModelChip { name: "jev-1.13".into(), spam: true, err: false, score: 0.956 },
-            ModelChip { name: "clef-omni".into(), spam: false, err: false, score: 0.1 },
-            ModelChip { name: "m3".into(), spam: false, err: true, score: 0.0 },
+            ModelChip {
+                name: "jev-1.13".into(),
+                spam: true,
+                err: false,
+                score: 0.956,
+            },
+            ModelChip {
+                name: "clef-omni".into(),
+                spam: false,
+                err: false,
+                score: 0.1,
+            },
+            ModelChip {
+                name: "m3".into(),
+                spam: false,
+                err: true,
+                score: 0.0,
+            },
         ];
         let h = chips_html(&chips);
         assert!(h.contains("class=\"chip s\""));
@@ -1014,7 +1605,16 @@ mod tests {
         // record() attaches chips to the entry
         let s = Stats::new();
         s.record(
-            RecentEntry { ts: "t".into(), queue_id: "q".into(), sender: "a@x".into(), spam: true, whitelisted: false, temperror: false, summary: "s".into(), models: Vec::new() },
+            RecentEntry {
+                ts: "t".into(),
+                queue_id: "q".into(),
+                sender: "a@x".into(),
+                spam: true,
+                whitelisted: false,
+                temperror: false,
+                summary: "s".into(),
+                models: Vec::new(),
+            },
             &[("org/jev-1.13".into(), true, 0.9, 10, None, false)],
         );
         let v = s.snapshot_json(0);
@@ -1024,14 +1624,24 @@ mod tests {
 
     #[test]
     fn index_page_is_live() {
-        let opts = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: None, scramble_senders: false };
+        let opts = DashboardOpts {
+            stats: Stats::new(),
+            spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
+            token: None,
+            scramble_senders: false,
+        };
         let out = handle_request("GET / HTTP/1.1\r\n\r\n", &opts);
         let body = String::from_utf8_lossy(&out);
         assert!(body.contains("id=\"c-total\""));
         assert!(body.contains("id=\"m-models\""));
         assert!(body.contains("setInterval(tick, 3000)"));
         // with token auth, nav keeps ?token=
-        let opts_t = DashboardOpts { stats: Stats::new(), spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"), token: Some("s".into()), scramble_senders: false };
+        let opts_t = DashboardOpts {
+            stats: Stats::new(),
+            spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
+            token: Some("s".into()),
+            scramble_senders: false,
+        };
         let out = handle_request("GET /?token=s HTTP/1.1\r\n\r\n", &opts_t);
         let body = String::from_utf8_lossy(&out);
         assert!(body.contains("/mails?token=s"));

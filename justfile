@@ -19,6 +19,28 @@ build-release:
 test:
     cargo test
 
+# pre-push gate: format check + clippy (deny warnings) + tests
+check:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test
+
+# coverage report (needs cargo-llvm-cov: cargo install cargo-llvm-cov)
+cov:
+    cargo llvm-cov --summary-only
+
+# format the code
+fmt:
+    cargo fmt --all
+
+# install as systemd service (root): deploy/install.sh
+install: build-linux-amd64
+    sudo deploy/install.sh
+
+# install + start + smoke-check
+deploy: build-linux-amd64
+    sudo deploy/install.sh --start
+
 # one-time setup for the Linux cross build
 setup:
     rustup target add {{macos_target}} {{linux_target}}

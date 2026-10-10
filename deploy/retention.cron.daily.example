@@ -1,0 +1,7 @@
+# Rotate the spam quarantine: keep 30 days, delete older files.
+# Install as /etc/cron.daily/ai-classification-milter (chmod 0755, root:root).
+#
+# The quarantine contains PII (full mail bodies, addresses) — treat retention as
+# a data-protection decision, not just disk hygiene. 30 days is a starting point.
+find /var/lib/ai-classification-milter/spam-quarantine \
+  -type f \( -name '*.eml' -o -name '*.json' \) -mtime +30 -delete 2>/dev/null || true

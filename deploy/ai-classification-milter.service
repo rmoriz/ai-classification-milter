@@ -1,0 +1,57 @@
+[Unit]
+Description=ai-classification-milter (Postfix pre-queue milter, OpenRouter Decisions API)
+Documentation=https://github.com/rmoriz/ai-classification-milter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=_ai-milter
+Group=_ai-milter
+EnvironmentFile=/etc/ai-classification-milter.env
+ExecStart=/usr/local/sbin/ai-classification-milter
+Restart=always
+# Fail-open: Postfix accepts when the milter is dead or slow
+# (milter_default_action=accept), so a fast restart beats a long backoff.
+RestartSec=3
+TimeoutStopSec=10
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-classification-milter
+
+# --- State -------------------------------------------------------------------
+# StateDirectory= creates /var/lib/ai-classification-milter with the right owner
+# AND makes it writable under ProtectSystem=strict. This is the replacement for
+# a ReadWritePaths= entry: if you list a path there that does not exist, systemd
+# fails with 226/NAMESPACE before the binary ever starts.
+StateDirectory=ai-classification-milter
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/ai-classification-milter
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Memory guard: per mail ~ headers (200 x 2048) + body cap (100 KB). This is a
+# ceiling, not a reservation; raise it if you run large bodies / big concurrency.
+MemoryMax=256M
+
+# Optional, verify against your own workload before enabling:
+# SystemCallFilter=@system-service
+# SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -19,8 +19,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
+      - name: format check
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage
+        run: |
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee coverage.txt
+          # Informational: don't block PRs on coverage yet, but keep it visible.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage.txt
+          if-no-files-found: warn
 
   build:
     name: build (${{ matrix.name }})

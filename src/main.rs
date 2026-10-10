@@ -38,7 +38,7 @@ enum Decision {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppConfig {
+struct AppConfig {
     pub listen: String,
     pub models: Vec<ModelEndpoint>,
     pub openrouter_url: String,
@@ -90,7 +90,10 @@ fn parse_models(env: &dyn Fn(&str) -> Option<String>) -> (Vec<ModelEndpoint>, bo
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .map(|name| ModelEndpoint { name: name.to_string(), url: url.clone() })
+                .map(|name| ModelEndpoint {
+                    name: name.to_string(),
+                    url: url.clone(),
+                })
                 .collect();
             if !v.is_empty() {
                 return (v, true);
@@ -101,7 +104,10 @@ fn parse_models(env: &dyn Fn(&str) -> Option<String>) -> (Vec<ModelEndpoint>, bo
         let url = env("OPENROUTER_URL").unwrap_or_else(|| DEFAULT_OPENROUTER_URL.into());
         let v: Vec<ModelEndpoint> = DEFAULT_OPENROUTER_MODELS
             .split(',')
-            .map(|name| ModelEndpoint { name: name.to_string(), url: url.clone() })
+            .map(|name| ModelEndpoint {
+                name: name.to_string(),
+                url: url.clone(),
+            })
             .collect();
         return (v, true);
     }
@@ -115,7 +121,10 @@ fn parse_models(env: &dyn Fn(&str) -> Option<String>) -> (Vec<ModelEndpoint>, bo
                     return None;
                 }
                 let (name, url) = e.split_once('=')?;
-                Some(ModelEndpoint { name: name.trim().to_string(), url: url.trim().to_string() })
+                Some(ModelEndpoint {
+                    name: name.trim().to_string(),
+                    url: url.trim().to_string(),
+                })
             })
             .collect();
         if !v.is_empty() {
@@ -123,10 +132,14 @@ fn parse_models(env: &dyn Fn(&str) -> Option<String>) -> (Vec<ModelEndpoint>, bo
         }
     }
     // Fallback: single legacy model.
-    (vec![ModelEndpoint {
-        name: env("LLM_MODEL").unwrap_or_else(|| "spam-decision".into()),
-        url: env("LLM_URL").unwrap_or_else(|| "http://127.0.0.1:11434/v1/chat/completions".into()),
-    }], false)
+    (
+        vec![ModelEndpoint {
+            name: env("LLM_MODEL").unwrap_or_else(|| "spam-decision".into()),
+            url: env("LLM_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:11434/v1/chat/completions".into()),
+        }],
+        false,
+    )
 }
 
 #[allow(dead_code)]
@@ -252,9 +265,13 @@ impl AppConfig {
         let log = fc.logging.unwrap_or_default();
 
         let bool_val = |e: Option<String>, f: Option<bool>, dflt: bool| {
-            e.map(|v| v == "1" || v.eq_ignore_ascii_case("true")).or(f).unwrap_or(dflt)
+            e.map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .or(f)
+                .unwrap_or(dflt)
         };
-        let decision_src = env("DECISION").or(lim.decision).unwrap_or_else(|| "any".into());
+        let decision_src = env("DECISION")
+            .or(lim.decision)
+            .unwrap_or_else(|| "any".into());
         let decision = match decision_src.as_str() {
             "majority" => Decision::Majority,
             "all" => Decision::All,
@@ -273,7 +290,10 @@ impl AppConfig {
                         return None;
                     }
                     let (name, url) = e.split_once('=')?;
-                    Some(ModelEndpoint { name: name.trim().to_string(), url: url.trim().to_string() })
+                    Some(ModelEndpoint {
+                        name: name.trim().to_string(),
+                        url: url.trim().to_string(),
+                    })
                 })
                 .collect();
             if v.is_empty() {
@@ -291,17 +311,31 @@ impl AppConfig {
             .unwrap_or_else(|| DEFAULT_OPENROUTER_URL.into());
 
         let q = or.question.unwrap_or_default();
-        let question_instructions = env("QUESTION_INSTRUCTIONS").or(q.instructions).unwrap_or_else(|| DEFAULT_QUESTION.into());
-        let question_true = env("QUESTION_TRUE").or(q.criteria_true).unwrap_or_else(|| DEFAULT_CRITERIA_TRUE.into());
-        let question_false = env("QUESTION_FALSE").or(q.criteria_false).unwrap_or_else(|| DEFAULT_CRITERIA_FALSE.into());
+        let question_instructions = env("QUESTION_INSTRUCTIONS")
+            .or(q.instructions)
+            .unwrap_or_else(|| DEFAULT_QUESTION.into());
+        let question_true = env("QUESTION_TRUE")
+            .or(q.criteria_true)
+            .unwrap_or_else(|| DEFAULT_CRITERIA_TRUE.into());
+        let question_false = env("QUESTION_FALSE")
+            .or(q.criteria_false)
+            .unwrap_or_else(|| DEFAULT_CRITERIA_FALSE.into());
 
         // Whitelist sender domains: env WHITELIST_SENDER_DOMAINS (comma-separated) > TOML [whitelist] > empty.
         let whitelist_sender_domains: Vec<String> = env("WHITELIST_SENDER_DOMAINS")
-            .map(|raw| raw.split(',').map(|s| normalize_domain(s)).filter(|s| !s.is_empty()).collect())
+            .map(|raw| {
+                raw.split(',')
+                    .map(normalize_domain)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .filter(|v: &Vec<String>| !v.is_empty())
             .or_else(|| {
                 fc.whitelist.and_then(|w| w.sender_domains).map(|v| {
-                    v.into_iter().map(|s| normalize_domain(&s)).filter(|s| !s.is_empty()).collect()
+                    v.into_iter()
+                        .map(|s| normalize_domain(&s))
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 })
             })
             .filter(|v: &Vec<String>| !v.is_empty())
@@ -313,11 +347,19 @@ impl AppConfig {
         let dashboard_listen = env("DASHBOARD_LISTEN")
             .or(dash.listen)
             .unwrap_or_else(|| "127.0.0.1:8892".into());
-        let dashboard_token = env("DASHBOARD_TOKEN").or(dash.token).filter(|t| !t.is_empty());
-        let dashboard_scramble_senders = bool_val(env("DASHBOARD_SCRAMBLE_SENDERS"), dash.scramble_senders, false);
+        let dashboard_token = env("DASHBOARD_TOKEN")
+            .or(dash.token)
+            .filter(|t| !t.is_empty());
+        let dashboard_scramble_senders = bool_val(
+            env("DASHBOARD_SCRAMBLE_SENDERS"),
+            dash.scramble_senders,
+            false,
+        );
 
         Self {
-            listen: env("MILTER_LISTEN").or(fc.listen).unwrap_or_else(|| "127.0.0.1:8891".into()),
+            listen: env("MILTER_LISTEN")
+                .or(fc.listen)
+                .unwrap_or_else(|| "127.0.0.1:8891".into()),
             models,
             openrouter_url,
             openrouter_mode,
@@ -326,18 +368,46 @@ impl AppConfig {
             question_instructions,
             question_true,
             question_false,
-            llm_api_key: env("OPENROUTER_API_KEY").or_else(|| env("LLM_API_KEY")).or(or.api_key),
+            llm_api_key: env("OPENROUTER_API_KEY")
+                .or_else(|| env("LLM_API_KEY"))
+                .or(or.api_key),
             llm_timeout: Duration::from_secs(
-                env("LLM_TIMEOUT_SECS").and_then(|v| v.parse().ok()).or(lim.llm_timeout_secs).unwrap_or(5),
+                env("LLM_TIMEOUT_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .or(lim.llm_timeout_secs)
+                    .unwrap_or(5),
             ),
-            score_threshold: env("SCORE_THRESHOLD").and_then(|v| v.parse().ok()).or(lim.score_threshold).unwrap_or(0.85),
+            score_threshold: env("SCORE_THRESHOLD")
+                .and_then(|v| v.parse().ok())
+                .or(lim.score_threshold)
+                .unwrap_or(0.85),
             decision,
-            header_max_count: env("HEADER_MAX_COUNT").and_then(|v| v.parse().ok()).or(lim.header_max_count).unwrap_or(200),
-            header_max_value_chars: env("HEADER_MAX_VALUE_CHARS").and_then(|v| v.parse().ok()).or(lim.header_max_value_chars).unwrap_or(2048),
-            body_max_bytes: env("BODY_MAX_BYTES").and_then(|v| v.parse().ok()).or(lim.body_max_bytes).unwrap_or(100_000),
-            llm_body_chars: env("LLM_BODY_CHARS").and_then(|v| v.parse().ok()).or(lim.llm_body_chars).unwrap_or(4000),
-            log_spam_dir: PathBuf::from(env("LOG_SPAM_DIR").or(log.spam_dir).unwrap_or_else(|| "./spam-quarantine".into())),
-            eval_log: PathBuf::from(env("EVAL_LOG").or(log.eval_log).unwrap_or_else(|| "./eval.jsonl".into())),
+            header_max_count: env("HEADER_MAX_COUNT")
+                .and_then(|v| v.parse().ok())
+                .or(lim.header_max_count)
+                .unwrap_or(200),
+            header_max_value_chars: env("HEADER_MAX_VALUE_CHARS")
+                .and_then(|v| v.parse().ok())
+                .or(lim.header_max_value_chars)
+                .unwrap_or(2048),
+            body_max_bytes: env("BODY_MAX_BYTES")
+                .and_then(|v| v.parse().ok())
+                .or(lim.body_max_bytes)
+                .unwrap_or(100_000),
+            llm_body_chars: env("LLM_BODY_CHARS")
+                .and_then(|v| v.parse().ok())
+                .or(lim.llm_body_chars)
+                .unwrap_or(4000),
+            log_spam_dir: PathBuf::from(
+                env("LOG_SPAM_DIR")
+                    .or(log.spam_dir)
+                    .unwrap_or_else(|| "./spam-quarantine".into()),
+            ),
+            eval_log: PathBuf::from(
+                env("EVAL_LOG")
+                    .or(log.eval_log)
+                    .unwrap_or_else(|| "./eval.jsonl".into()),
+            ),
             log_all_mails: bool_val(env("LOG_ALL_MAILS"), log.log_all_mails, false),
             learn_mode: bool_val(env("LEARN_MODE"), log.learn_mode, true),
             whitelist_sender_domains,
@@ -358,17 +428,37 @@ fn openrouter_endpoints(
         .or_else(|| or.url.clone())
         .unwrap_or_else(|| DEFAULT_OPENROUTER_URL.into());
     let names: Vec<String> = env("OPENROUTER_MODELS")
-        .map(|raw| raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .filter(|v: &Vec<String>| !v.is_empty())
         .or_else(|| or.models.clone())
-        .unwrap_or_else(|| DEFAULT_OPENROUTER_MODELS.split(',').map(str::to_string).collect());
-    let v = names.into_iter().map(|name| ModelEndpoint { name, url: url.clone() }).collect();
+        .unwrap_or_else(|| {
+            DEFAULT_OPENROUTER_MODELS
+                .split(',')
+                .map(str::to_string)
+                .collect()
+        });
+    let v = names
+        .into_iter()
+        .map(|name| ModelEndpoint {
+            name,
+            url: url.clone(),
+        })
+        .collect();
     (v, true)
 }
 
 /// Normalize a domain: trim, strip leading dot and trailing FQDN dot, lowercase.
 fn normalize_domain(s: &str) -> String {
-    s.trim().trim_start_matches('.').trim_end_matches('.').trim().to_lowercase()
+    s.trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .trim()
+        .to_lowercase()
 }
 
 /// Reduce an envelope sender ("<user@domain>", "user@domain", "\"Name\" <user@domain>", "<>")
@@ -380,9 +470,14 @@ fn sender_domain(sender: &str) -> Option<String> {
     }
     // For "Name <addr>" take the last angle-bracket pair.
     let addr = if let (Some(a), Some(b)) = (s.rfind('<'), s.rfind('>')) {
-        if a < b { &s[a + 1..b] } else { s }
+        if a < b {
+            &s[a + 1..b]
+        } else {
+            s
+        }
     } else {
-        s.trim_matches(|c| c == '<' || c == '>' || c == '"' || c == '\'' || c == ' ').trim()
+        s.trim_matches(|c| c == '<' || c == '>' || c == '"' || c == '\'' || c == ' ')
+            .trim()
     };
     let addr = addr.trim();
     if addr.is_empty() || addr == "<>" {
@@ -398,7 +493,11 @@ fn sender_domain(sender: &str) -> Option<String> {
 
 /// true if the sender domain (exact or subdomain) is whitelisted.
 /// Falls back to the From header when the envelope is empty (CLI mode without envelope).
-fn is_sender_whitelisted(cfg: &AppConfig, envelope_from: &str, headers: &[(String, String)]) -> bool {
+fn is_sender_whitelisted(
+    cfg: &AppConfig,
+    envelope_from: &str,
+    headers: &[(String, String)],
+) -> bool {
     if cfg.whitelist_sender_domains.is_empty() {
         return false;
     }
@@ -418,7 +517,9 @@ fn is_sender_whitelisted(cfg: &AppConfig, envelope_from: &str, headers: &[(Strin
         }
     }
     candidates.into_iter().any(|d| {
-        cfg.whitelist_sender_domains.iter().any(|w| d == *w || d.ends_with(&format!(".{w}")))
+        cfg.whitelist_sender_domains
+            .iter()
+            .any(|w| d == *w || d.ends_with(&format!(".{w}")))
     })
 }
 
@@ -510,7 +611,10 @@ fn get_macro(ctx_macros: &indymilter::Macros, name: &[u8]) -> String {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
-    ctx_macros.get(cstr).map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()
+    ctx_macros
+        .get(cstr)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 // ------------------------------------------------------- Decisions API client
@@ -557,8 +661,11 @@ struct DecisionsResponse {
 struct DecisionsUsage {
     #[serde(default)]
     cost: Option<f64>,
+    // Kept for future token/cost analytics; not consumed yet.
+    #[allow(dead_code)]
     #[serde(default)]
     input_tokens: Option<u64>,
+    #[allow(dead_code)]
     #[serde(default)]
     output_tokens: Option<u64>,
 }
@@ -567,25 +674,52 @@ struct DecisionsUsage {
 /// Extract "yes"/"no" + percentage robustly from free model text.
 /// percentage = spam probability 0-100 (the prompt defines it that way).
 fn parse_verdict_text(s: &str) -> Result<LlmVerdict, String> {
-    let t = s.trim().trim_start_matches("```json").trim_start_matches("```")
-        .trim_end_matches("```").trim();
+    let t = s
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
     // 1) try strict JSON first
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
-        let verdict_str = v.get("verdict").and_then(|x| x.as_str()).unwrap_or("")
+        let verdict_str = v
+            .get("verdict")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
             .to_lowercase();
-        let bool_alt = v.get("verdict").and_then(|x| x.as_bool())
+        let bool_alt = v
+            .get("verdict")
+            .and_then(|x| x.as_bool())
             .or_else(|| v.get("spam").and_then(|x| x.as_bool()));
-        let pct = v.get("percentage").or_else(|| v.get("score")).or_else(|| v.get("confidence"))
-            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.trim_end_matches('%').parse().ok())));
-        let reason = v.get("reason").or_else(|| v.get("explanation"))
-            .and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let pct = v
+            .get("percentage")
+            .or_else(|| v.get("score"))
+            .or_else(|| v.get("confidence"))
+            .and_then(|x| {
+                x.as_f64().or_else(|| {
+                    x.as_str()
+                        .and_then(|s| s.trim_end_matches('%').parse().ok())
+                })
+            });
+        let reason = v
+            .get("reason")
+            .or_else(|| v.get("explanation"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         if !verdict_str.is_empty() || bool_alt.is_some() || pct.is_some() {
-            let spam = bool_alt.unwrap_or_else(|| verdict_str.starts_with("yes") || verdict_str == "true" || verdict_str == "1");
+            let spam = bool_alt.unwrap_or_else(|| {
+                verdict_str.starts_with("yes") || verdict_str == "true" || verdict_str == "1"
+            });
             let mut score = pct.unwrap_or(if spam { 90.0 } else { 10.0 }) as f32;
             if score > 1.0 {
                 score /= 100.0;
             }
-            return Ok(LlmVerdict { spam, score: score.clamp(0.0, 1.0), reason: reason.chars().take(200).collect() });
+            return Ok(LlmVerdict {
+                spam,
+                score: score.clamp(0.0, 1.0),
+                reason: reason.chars().take(200).collect(),
+            });
         }
     }
     // 2) Fallback: first yes/no + first NN% value
@@ -624,17 +758,30 @@ fn parse_verdict_text(s: &str) -> Result<LlmVerdict, String> {
         } else {
             pct.unwrap_or(50.0) >= 50.0
         };
-        let score = pct.map(|p| (p / 100.0).clamp(0.0, 1.0)).unwrap_or(if spam { 0.85 } else { 0.15 });
-        return Ok(LlmVerdict { spam, score, reason: t.chars().take(200).collect() });
+        let score =
+            pct.map(|p| (p / 100.0).clamp(0.0, 1.0))
+                .unwrap_or(if spam { 0.85 } else { 0.15 });
+        return Ok(LlmVerdict {
+            spam,
+            score,
+            reason: t.chars().take(200).collect(),
+        });
     }
-    Err(format!("unparseable verdict: {}", t.chars().take(120).collect::<String>()))
+    Err(format!(
+        "unparseable verdict: {}",
+        t.chars().take(120).collect::<String>()
+    ))
 }
 
 /// STATE for the Decisions API: all headers as an array (duplicates like Received
 /// are preserved), plus envelope + body excerpt.
 #[allow(dead_code)]
 fn build_state_value(base: &LlmRequest) -> serde_json::Value {
-    let headers: Vec<String> = base.headers.iter().map(|(n, v)| format!("{n}: {v}")).collect();
+    let headers: Vec<String> = base
+        .headers
+        .iter()
+        .map(|(n, v)| format!("{n}: {v}"))
+        .collect();
     serde_json::json!({
         "envelope_from": base.envelope_from,
         "envelope_rcpts": base.envelope_rcpts,
@@ -650,7 +797,11 @@ fn build_state_value(base: &LlmRequest) -> serde_json::Value {
 /// score_threshold + decision policy in the caller.
 fn verdict_from_noul(p: f64) -> LlmVerdict {
     let p = (p as f32).clamp(0.0, 1.0);
-    LlmVerdict { spam: p >= 0.5, score: p, reason: format!("noul={p:.3}") }
+    LlmVerdict {
+        spam: p >= 0.5,
+        score: p,
+        reason: format!("noul={p:.3}"),
+    }
 }
 
 async fn query_openrouter(
@@ -659,18 +810,31 @@ async fn query_openrouter(
     base: &LlmRequest,
 ) -> Result<(LlmVerdict, Option<f64>), String> {
     let mut questions = std::collections::HashMap::new();
-    questions.insert("is_spam".to_string(), NoulQuestion {
-        kind: "noul",
-        instructions: cfg.question_instructions.clone(),
-        criteria: NoulCriteria { yes: cfg.question_true.clone(), no: cfg.question_false.clone() },
-    });
+    questions.insert(
+        "is_spam".to_string(),
+        NoulQuestion {
+            kind: "noul",
+            instructions: cfg.question_instructions.clone(),
+            criteria: NoulCriteria {
+                yes: cfg.question_true.clone(),
+                no: cfg.question_false.clone(),
+            },
+        },
+    );
     let body = DecisionsRequest {
         model: ep.name.clone(),
         state: build_state_value(base),
         questions,
-        session_id: if base.queue_id.is_empty() { None } else { Some(base.queue_id.clone()) },
+        session_id: if base.queue_id.is_empty() {
+            None
+        } else {
+            Some(base.queue_id.clone())
+        },
     };
-    let mut b = client().post(&cfg.openrouter_url).json(&body).timeout(cfg.llm_timeout);
+    let mut b = client()
+        .post(&cfg.openrouter_url)
+        .json(&body)
+        .timeout(cfg.llm_timeout);
     if let Some(key) = &cfg.llm_api_key {
         b = b.bearer_auth(key);
     }
@@ -687,13 +851,26 @@ async fn query_openrouter(
         // Unpack the OpenRouter error format {error:{message}}, otherwise a snippet.
         let msg = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(str::to_string))
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| text.chars().take(200).collect::<String>());
         return Err(format!("decisions http {status}: {msg}"));
     }
-    let dec = resp.json::<DecisionsResponse>().await.map_err(|e| e.to_string())?;
-    let ans = dec.answers.get("is_spam").ok_or("decisions: missing is_spam answer")?;
-    let p = ans.get("noul").and_then(|v| v.as_f64())
+    let dec = resp
+        .json::<DecisionsResponse>()
+        .await
+        .map_err(|e| e.to_string())?;
+    let ans = dec
+        .answers
+        .get("is_spam")
+        .ok_or("decisions: missing is_spam answer")?;
+    let p = ans
+        .get("noul")
+        .and_then(|v| v.as_f64())
         .ok_or_else(|| format!("decisions: no noul value in {ans}"))?;
     Ok((verdict_from_noul(p), dec.usage.cost))
 }
@@ -716,11 +893,7 @@ async fn query_legacy(
     resp.json::<LlmVerdict>().await.map_err(|e| e.to_string())
 }
 
-async fn query_one(
-    cfg: &AppConfig,
-    ep: &ModelEndpoint,
-    base: &LlmRequest,
-) -> ModelOutcome {
+async fn query_one(cfg: &AppConfig, ep: &ModelEndpoint, base: &LlmRequest) -> ModelOutcome {
     let t0 = Instant::now();
     let res: Result<(LlmVerdict, Option<f64>), String> = if cfg.openrouter_mode {
         query_openrouter(cfg, ep, base).await
@@ -731,7 +904,14 @@ async fn query_one(
     match res {
         Ok((v, cost)) => {
             let is_spam = v.spam || v.score >= cfg.score_threshold;
-            ModelOutcome { model: ep.name.clone(), verdict: v, error: None, latency_ms, cost_usd: cost, is_spam }
+            ModelOutcome {
+                model: ep.name.clone(),
+                verdict: v,
+                error: None,
+                latency_ms,
+                cost_usd: cost,
+                is_spam,
+            }
         }
         Err(e) => ModelOutcome {
             model: ep.name.clone(),
@@ -774,7 +954,9 @@ fn verdict_tag(outcomes: &[ModelOutcome]) -> String {
             } else {
                 let label = if o.is_spam { "spam" } else { "ham" };
                 let reason: String = o.verdict.reason.chars().take(40).collect();
-                format!("{}={}.{:.2} {}", o.model, label, o.verdict.score, reason).trim_end().to_string()
+                format!("{}={}.{:.2} {}", o.model, label, o.verdict.score, reason)
+                    .trim_end()
+                    .to_string()
             }
         })
         .collect();
@@ -794,9 +976,18 @@ fn record_stats(
     temperror: bool,
     outcomes: &[ModelOutcome],
 ) {
-    let models: Vec<(String, bool, f32, u64, Option<f64>, bool)> = outcomes
+    let models: Vec<dashboard::ModelRow> = outcomes
         .iter()
-        .map(|o| (o.model.clone(), o.is_spam, o.verdict.score, o.latency_ms, o.cost_usd, o.error.is_some()))
+        .map(|o| {
+            (
+                o.model.clone(),
+                o.is_spam,
+                o.verdict.score,
+                o.latency_ms,
+                o.cost_usd,
+                o.error.is_some(),
+            )
+        })
         .collect();
     stats.record(
         dashboard::RecentEntry {
@@ -807,7 +998,11 @@ fn record_stats(
             whitelisted,
             temperror,
             summary: if outcomes.is_empty() {
-                if whitelisted { "whitelisted".into() } else { "temperror".into() }
+                if whitelisted {
+                    "whitelisted".into()
+                } else {
+                    "temperror".into()
+                }
             } else {
                 verdict_tag(outcomes)
             },
@@ -829,10 +1024,19 @@ async fn append_eval_log(cfg: &AppConfig, line: &serde_json::Value) {
             }
         }
     }
-    match tokio::fs::OpenOptions::new().create(true).append(true).open(&cfg.eval_log).await {
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cfg.eval_log)
+        .await
+    {
         Ok(mut f) => {
             if let Err(e) = f.write_all(format!("{s}\n").as_bytes()).await {
                 warn!(error = %e, "eval log write failed");
+            // Explicit flush: tokio::fs::File buffers in the blocking pool and a
+            // bare drop can discard the tail, losing the most recent eval line.
+            } else if let Err(e) = f.flush().await {
+                warn!(error = %e, "eval log flush failed");
             }
         }
         Err(e) => warn!(error = %e, "eval log open failed"),
@@ -853,7 +1057,11 @@ async fn log_mail_eml(
         return;
     }
     let ts = Local::now().format("%Y%m%dT%H%M%S");
-    let qid = if queue_id.is_empty() { "noqid".into() } else { queue_id.replace('/', "_") };
+    let qid = if queue_id.is_empty() {
+        "noqid".into()
+    } else {
+        queue_id.replace('/', "_")
+    };
     let stem = format!("{ts}_{qid}_{tag}");
     let eml_path = cfg.log_spam_dir.join(format!("{stem}.eml"));
     let json_path = cfg.log_spam_dir.join(format!("{stem}.json"));
@@ -880,7 +1088,8 @@ async fn log_mail_eml(
     } else {
         info!(path = %eml_path.display(), "mail logged");
     }
-    if let Err(e) = tokio::fs::write(&json_path, serde_json::to_string_pretty(&meta).unwrap()).await {
+    if let Err(e) = tokio::fs::write(&json_path, serde_json::to_string_pretty(&meta).unwrap()).await
+    {
         warn!(error = %e, "meta write failed");
     }
 }
@@ -951,7 +1160,10 @@ async fn run_cli(cfg: &AppConfig, json_out: bool) -> std::io::Result<()> {
             );
             return Ok(());
         }
-        println!("WHITELISTED (sender domain): {} -> ham (no LLM call)", envelope_from);
+        println!(
+            "WHITELISTED (sender domain): {} -> ham (no LLM call)",
+            envelope_from
+        );
         return Ok(());
     }
     let body_text = String::from_utf8_lossy(&state.body);
@@ -971,27 +1183,49 @@ async fn run_cli(cfg: &AppConfig, json_out: bool) -> std::io::Result<()> {
     let spam = combine(cfg.decision, &outcomes);
 
     if json_out {
-        println!("{}", serde_json::json!({ "spam": spam, "outcomes": outcomes }));
+        println!(
+            "{}",
+            serde_json::json!({ "spam": spam, "outcomes": outcomes })
+        );
         return Ok(());
     }
-    println!("{:<38} {:<7} {:<7} {:<9} {}", "model", "verdict", "score", "latency", "cost/error");
+    println!(
+        "{:<38} {:<7} {:<7} {:<9} cost/error",
+        "model", "verdict", "score", "latency"
+    );
     for o in &outcomes {
         let (verdict, score) = match &o.error {
-            Some(e) => (format!("ERR"), e.chars().take(40).collect::<String>()),
+            Some(e) => ("ERR".to_string(), e.chars().take(40).collect::<String>()),
             None => (
                 if o.is_spam { "SPAM" } else { "ham" }.to_string(),
                 format!("{:.3}", o.verdict.score),
             ),
         };
-        let cost = o.cost_usd.map(|c| format!("${c:.5}")).unwrap_or_else(|| "-".into());
-        println!("{:<38} {:<7} {:<7} {:<9} {}", o.model, verdict, score, format!("{}ms", o.latency_ms), cost);
+        let cost = o
+            .cost_usd
+            .map(|c| format!("${c:.5}"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<38} {:<7} {:<7} {:<9} {}",
+            o.model,
+            verdict,
+            score,
+            format!("{}ms", o.latency_ms),
+            cost
+        );
     }
-    println!("COMBINED ({:?}): {}", cfg.decision, if spam { "SPAM" } else { "ham" });
+    println!(
+        "COMBINED ({:?}): {}",
+        cfg.decision,
+        if spam { "SPAM" } else { "ham" }
+    );
     Ok(())
 }
 
 fn print_usage() {
-    println!("usage: ai-classification-milter [-i|--stdin] [--json] [-c|--config <path>] [-h|--help]");
+    println!(
+        "usage: ai-classification-milter [-i|--stdin] [--json] [-c|--config <path>] [-h|--help]"
+    );
     println!("  no args: milter daemon (Postfix).");
     println!("  -i:        read mail from stdin (paste + Ctrl+D), query all models.");
     println!("  --json:    combinable with -i, JSON instead of table.");
@@ -1207,11 +1441,15 @@ async fn main() -> std::io::Result<()> {
             }
         });
 
-    let mut milter_cfg = Config::default();
-    milter_cfg.actions = Actions::ADD_HEADER;
+    let milter_cfg = Config {
+        actions: Actions::ADD_HEADER,
+        ..Default::default()
+    };
 
     let listener = TcpListener::bind(&cfg.listen).await?;
-    let shutdown = async { tokio::signal::ctrl_c().await.ok(); };
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
     indymilter::run(listener, cbs, milter_cfg, shutdown).await
 }
 
@@ -1222,11 +1460,17 @@ mod tests {
     #[test]
     fn decisions_request_matches_docs_schema() {
         let mut questions = std::collections::HashMap::new();
-        questions.insert("is_spam".to_string(), NoulQuestion {
-            kind: "noul",
-            instructions: DEFAULT_QUESTION.into(),
-            criteria: NoulCriteria { yes: "y".into(), no: "n".into() },
-        });
+        questions.insert(
+            "is_spam".to_string(),
+            NoulQuestion {
+                kind: "noul",
+                instructions: DEFAULT_QUESTION.into(),
+                criteria: NoulCriteria {
+                    yes: "y".into(),
+                    no: "n".into(),
+                },
+            },
+        );
         let req = DecisionsRequest {
             model: "typesafe/jev-1.13".into(),
             state: serde_json::json!({"headers": ["Subject: x"]}),
@@ -1242,6 +1486,19 @@ mod tests {
         // Noul answer: yes probability
         let ans: serde_json::Value = serde_json::json!({"type": "noul", "noul": 0.96});
         assert!((ans["noul"].as_f64().unwrap() - 0.96).abs() < 1e-9);
+    }
+
+    /// Unique-per-call temp path. Uses an atomic counter rather than the pid or
+    /// thread id: `#[tokio::test]` runs on runtime worker threads, whose ids
+    /// repeat across concurrently executing tests.
+    fn unique_tmp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "aim-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     fn test_config() -> AppConfig {
@@ -1263,8 +1520,8 @@ mod tests {
             header_max_value_chars: 5,
             body_max_bytes: 10,
             llm_body_chars: 4000,
-            log_spam_dir: PathBuf::from("/tmp"),
-            eval_log: PathBuf::from("/tmp/eval.jsonl"),
+            log_spam_dir: unique_tmp("cfg-spam"),
+            eval_log: unique_tmp("cfg-eval").join("eval.jsonl"),
             log_all_mails: false,
             learn_mode: true,
             whitelist_sender_domains: vec!["example.com".into(), "dept.example.com".into()],
@@ -1278,7 +1535,11 @@ mod tests {
     fn outcome(model: &str, spam: bool, score: f32) -> ModelOutcome {
         ModelOutcome {
             model: model.into(),
-            verdict: LlmVerdict { spam, score, reason: String::new() },
+            verdict: LlmVerdict {
+                spam,
+                score,
+                reason: String::new(),
+            },
             error: None,
             latency_ms: 1,
             cost_usd: None,
@@ -1312,12 +1573,20 @@ mod tests {
 
     #[test]
     fn combine_policies() {
-        let mixed = vec![outcome("a", true, 0.9), outcome("b", false, 0.1), outcome("c", false, 0.2)];
+        let mixed = vec![
+            outcome("a", true, 0.9),
+            outcome("b", false, 0.1),
+            outcome("c", false, 0.2),
+        ];
         assert!(combine(Decision::Any, &mixed));
         assert!(!combine(Decision::Majority, &mixed));
         assert!(!combine(Decision::All, &mixed));
 
-        let two_spam = vec![outcome("a", true, 0.9), outcome("b", true, 0.8), outcome("c", false, 0.1)];
+        let two_spam = vec![
+            outcome("a", true, 0.9),
+            outcome("b", true, 0.8),
+            outcome("c", false, 0.1),
+        ];
         assert!(combine(Decision::Any, &two_spam));
         assert!(combine(Decision::Majority, &two_spam));
         assert!(!combine(Decision::All, &two_spam));
@@ -1341,20 +1610,27 @@ mod tests {
 
     #[test]
     fn verdict_tag_format_and_cap() {
-        let outcomes = vec![outcome("a", true, 0.92), outcome("b", false, 0.1), failed("c")];
+        let outcomes = vec![
+            outcome("a", true, 0.92),
+            outcome("b", false, 0.1),
+            failed("c"),
+        ];
         let tag = verdict_tag(&outcomes);
         assert!(tag.contains("a=spam.0.92"));
         assert!(tag.contains("b=ham.0.10"));
         assert!(tag.contains("c=err:timeout"));
         // 500-char cap
-        let many: Vec<ModelOutcome> = (0..50).map(|i| outcome(&format!("model-{i:02}"), true, 0.99)).collect();
+        let many: Vec<ModelOutcome> = (0..50)
+            .map(|i| outcome(&format!("model-{i:02}"), true, 0.99))
+            .collect();
         assert!(verdict_tag(&many).chars().count() <= 500);
     }
 
     #[test]
     fn parse_mail_headers_and_body() {
         let cfg = test_config();
-        let raw = "From: a@x\r\nSubject: hi\r\nReceived: from mx\r\n\twith ESMTP id 1\r\n\r\nhello body";
+        let raw =
+            "From: a@x\r\nSubject: hi\r\nReceived: from mx\r\n\twith ESMTP id 1\r\n\r\nhello body";
         let st = parse_mail(&cfg, raw);
         // value cap of 5 chars applies
         assert_eq!(st.headers[0], ("From".into(), "a@x".into()));
@@ -1402,7 +1678,10 @@ mod tests {
         };
         let s = build_state_value(&base);
         // duplicates are preserved as an array
-        assert_eq!(s["email-headers"], serde_json::json!(["Received: from a", "Received: from b"]));
+        assert_eq!(
+            s["email-headers"],
+            serde_json::json!(["Received: from a", "Received: from b"])
+        );
         assert!(s.get("headers").is_none());
     }
 
@@ -1436,7 +1715,10 @@ mod tests {
         .unwrap();
         assert_eq!(fc.listen.unwrap(), "127.0.0.1:8899");
         assert_eq!(fc.openrouter.unwrap().models.unwrap(), vec!["a/b", "c/d"]);
-        assert_eq!(fc.limits.as_ref().unwrap().decision.as_deref(), Some("majority"));
+        assert_eq!(
+            fc.limits.as_ref().unwrap().decision.as_deref(),
+            Some("majority")
+        );
         assert_eq!(fc.logging.unwrap().learn_mode, Some(false));
     }
 
@@ -1470,8 +1752,17 @@ mod tests {
         let (v, mode) = openrouter_endpoints(&no_env, &or);
         assert!(mode && v.len() == 5);
         // Env beats TOML
-        let env = |k: &str| if k == "OPENROUTER_MODELS" { Some("x/y".into()) } else { None };
-        let or = OpenRouterSection { models: Some(vec!["toml/m".into()]), ..Default::default() };
+        let env = |k: &str| {
+            if k == "OPENROUTER_MODELS" {
+                Some("x/y".into())
+            } else {
+                None
+            }
+        };
+        let or = OpenRouterSection {
+            models: Some(vec!["toml/m".into()]),
+            ..Default::default()
+        };
         let (v, _) = openrouter_endpoints(&env, &or);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].name, "x/y");
@@ -1482,14 +1773,369 @@ mod tests {
 
     #[test]
     fn sender_domain_extraction() {
-        assert_eq!(sender_domain("<user@example.com>").as_deref(), Some("example.com"));
-        assert_eq!(sender_domain("user@EXAMPLE.COM").as_deref(), Some("example.com"));
-        assert_eq!(sender_domain("\"Doe, John\" <john@sub.example.com>").as_deref(), Some("sub.example.com"));
-        assert_eq!(sender_domain("  <USER@Example.Com.>  ").as_deref(), Some("example.com"));
+        assert_eq!(
+            sender_domain("<user@example.com>").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            sender_domain("user@EXAMPLE.COM").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            sender_domain("\"Doe, John\" <john@sub.example.com>").as_deref(),
+            Some("sub.example.com")
+        );
+        assert_eq!(
+            sender_domain("  <USER@Example.Com.>  ").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(sender_domain("<>"), None);
         assert_eq!(sender_domain(""), None);
         assert_eq!(sender_domain("not-an-addr"), None);
         assert_eq!(sender_domain("user@localhost"), None);
+    }
+
+    #[test]
+    fn parse_models_modes() {
+        let no_env = |_: &str| None;
+        // 1. explicit OPENROUTER_MODELS wins
+        let env = |k: &str| match k {
+            "OPENROUTER_MODELS" => Some("a/b, c/d ,, e/f".into()),
+            "OPENROUTER_URL" => Some("https://example.test/dec".into()),
+            _ => None,
+        };
+        let (v, mode) = parse_models(&env);
+        assert!(mode, "openrouter mode");
+        assert_eq!(v.len(), 3, "empty entries dropped");
+        assert_eq!(v[0].name, "a/b");
+        assert_eq!(v[0].url, "https://example.test/dec", "shared url");
+
+        // 2. blank OPENROUTER_MODELS skips the default branch (it is an `else` on
+        // `Some(raw)`), so it falls through to legacy/fallback instead
+        let blank = |k: &str| {
+            if k == "OPENROUTER_MODELS" {
+                Some("   ".into())
+            } else {
+                None
+            }
+        };
+        let (v, mode) = parse_models(&blank);
+        assert!(!mode, "blank value falls through to legacy");
+        assert_eq!(v.len(), 1);
+
+        // 3. no env at all -> the 5 defaults
+        let (v, mode) = parse_models(&no_env);
+        assert!(mode, "openrouter defaults");
+        assert_eq!(v.len(), 5);
+        assert_eq!(v[0].url, DEFAULT_OPENROUTER_URL);
+
+        // 4. MODELS alone is IGNORED: without OPENROUTER_MODELS the `else` branch
+        //    returns the 5 defaults before legacy is ever consulted
+        let models_only = |k: &str| {
+            if k == "MODELS" {
+                Some("x=http://a/y".into())
+            } else {
+                None
+            }
+        };
+        let (v, mode) = parse_models(&models_only);
+        assert!(mode, "MODELS alone does not select legacy mode");
+        assert_eq!(v.len(), 5);
+
+        // legacy needs OPENROUTER_MODELS set-but-empty to fall through
+        let legacy = |k: &str| match k {
+            "MODELS" => Some("x=http://a/y, z=http://b/y".into()),
+            "OPENROUTER_MODELS" => Some("  ".into()), // present but blank -> skips defaults
+            _ => None,
+        };
+        let (v, mode) = parse_models(&legacy);
+        assert!(!mode, "legacy mode");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].url, "http://a/y");
+        assert_eq!(v[1].name, "z");
+        // malformed entries are dropped
+        let bad = |k: &str| match k {
+            "MODELS" => Some("noequals, ok=http://c/y".into()),
+            "OPENROUTER_MODELS" => Some(" ".into()),
+            _ => None,
+        };
+        let (v, _) = parse_models(&bad);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "ok");
+
+        // 5. legacy entries without '=' -> single fallback model, named by
+        //    LLM_MODEL / LLM_URL (defaults if unset)
+        let broken = |k: &str| match k {
+            "MODELS" => Some("noequals,alsonone".into()),
+            "OPENROUTER_MODELS" => Some(" ".into()),
+            _ => None,
+        };
+        let (v, mode) = parse_models(&broken);
+        assert!(!mode && v.len() == 1, "fallback to a single model");
+        assert_eq!(v[0].name, "spam-decision", "built-in fallback name");
+        assert_eq!(v[0].url, "http://127.0.0.1:11434/v1/chat/completions");
+
+        // LLM_MODEL / LLM_URL override the fallback name and endpoint
+        let named = |k: &str| match k {
+            "MODELS" => Some("noequals".into()),
+            "OPENROUTER_MODELS" => Some(" ".into()),
+            "LLM_MODEL" => Some("my-model".into()),
+            "LLM_URL" => Some("http://local/v1".into()),
+            _ => None,
+        };
+        let (v, _) = parse_models(&named);
+        assert_eq!(v[0].name, "my-model");
+        assert_eq!(v[0].url, "http://local/v1");
+    }
+
+    #[test]
+    fn load_system_prompt_precedence() {
+        let missing = |k: &str| {
+            if k == "SYSTEM_PROMPT_FILE" {
+                Some("/tmp/does-not-exist-prompt.md".into())
+            } else {
+                None
+            }
+        };
+        // unreadable file -> built-in prompt
+        assert_eq!(load_system_prompt(&missing), BUILTIN_SYSTEM_PROMPT);
+
+        // existing file wins
+        let p = std::env::temp_dir().join(format!("aim-prompt-{}.md", std::process::id()));
+        std::fs::write(&p, "CUSTOM PROMPT").unwrap();
+        let env = |k: &str| {
+            if k == "SYSTEM_PROMPT_FILE" {
+                Some(p.to_string_lossy().into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(load_system_prompt(&env), "CUSTOM PROMPT");
+
+        // empty file -> built-in (never send an empty prompt)
+        std::fs::write(&p, "   \n ").unwrap();
+        assert_eq!(load_system_prompt(&env), BUILTIN_SYSTEM_PROMPT);
+        let _ = std::fs::remove_file(&p);
+
+        // no env -> tries ./prompt.md if present, else built-in
+        let none = |_: &str| None;
+        let got = load_system_prompt(&none);
+        assert!(got == BUILTIN_SYSTEM_PROMPT || !got.trim().is_empty());
+    }
+
+    #[test]
+    fn parse_mail_header_folding_and_separators() {
+        let cfg = test_config();
+        // CRLF + folded continuation + no trailing body
+        let raw = "Subject: hello\r\nX-Long: aaa\r\n  bbb\r\n\tccc\r\n\r\nbody here";
+        let st = parse_mail(&cfg, raw);
+        assert_eq!(st.headers[0].0, "Subject");
+        assert_eq!(st.headers[0].1, "hello");
+        // continuation lines folded into one value (truncated to 5 chars by cap)
+        assert_eq!(st.headers[1].0, "X-Long");
+        assert!(st.headers[1].1.starts_with("aaa"));
+        assert_eq!(String::from_utf8_lossy(&st.body), "body here");
+
+        // a header line without ':' is ignored, not a panic
+        let st = parse_mail(&cfg, "garbage-no-colon\nSubject: ok\n");
+        assert_eq!(st.headers.len(), 1);
+        assert_eq!(st.headers[0].0, "Subject");
+
+        // no separator at all -> everything is headers, empty body
+        let st = parse_mail(&cfg, "Subject: only");
+        assert_eq!(st.headers.len(), 1);
+        assert!(st.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn log_mail_eml_writes_eml_and_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "aim-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = test_config();
+        cfg.log_spam_dir = dir.join("q"); // nested: must be created
+
+        let mut st = MailState {
+            sender: "a@x".into(),
+            ..Default::default()
+        };
+        st.push_header(&cfg, "Subject", "hi");
+        st.push_body(&cfg, b"the body");
+
+        log_mail_eml(
+            &cfg,
+            "Q/ID", // queue id with a slash -> must be sanitized in the filename
+            "spam",
+            &st,
+            &[outcome("m1", true, 0.9)],
+            "a@x",
+            &["b@x".into()],
+        )
+        .await;
+
+        let entries: Vec<_> = std::fs::read_dir(cfg.log_spam_dir.clone())
+            .unwrap()
+            .flatten()
+            .collect();
+        let eml = entries
+            .iter()
+            .find(|e| e.path().extension().is_some_and(|x| x == "eml"))
+            .unwrap();
+        let json = entries
+            .iter()
+            .find(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .unwrap();
+
+        let eml_body = std::fs::read_to_string(eml.path()).unwrap();
+        assert!(eml_body.contains("Subject: hi"));
+        assert!(eml_body.contains("the body"));
+        // slash sanitized, never a subdirectory
+        assert!(!eml.path().to_string_lossy().contains("/Q/"));
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(json.path()).unwrap()).unwrap();
+        assert_eq!(meta["queue_id"], "Q/ID", "original value kept in meta");
+        assert_eq!(meta["verdict"], "spam");
+        assert_eq!(meta["envelope_from"], "a@x");
+        assert_eq!(meta["envelope_rcpts"][0], "b@x");
+        assert_eq!(meta["outcomes"][0]["model"], "m1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sender_domain_rejects_edge_cases() {
+        // already covered by sender_domain_extraction; these hit the remaining branches
+        assert_eq!(sender_domain("   "), None);
+        assert_eq!(sender_domain("<> "), None);
+        assert_eq!(sender_domain("<@nodomain>"), None);
+        assert_eq!(sender_domain("user@"), None);
+        assert_eq!(sender_domain("a@b.c"), Some("b.c".into()));
+        // bare address without angle brackets
+        assert_eq!(
+            sender_domain("user@sub.example.com"),
+            Some("sub.example.com".into())
+        );
+    }
+
+    #[test]
+    fn normalize_domain_variants() {
+        assert_eq!(normalize_domain("  Example.COM  "), "example.com");
+        assert_eq!(normalize_domain(".sub.example.com."), "sub.example.com");
+        assert_eq!(normalize_domain(""), "");
+        assert_eq!(normalize_domain("..."), "");
+    }
+
+    #[test]
+    fn push_header_and_body_respect_caps() {
+        let cfg = test_config(); // 3 headers, 5 value chars, 10 body bytes
+        let mut st = MailState::default();
+        st.push_header(&cfg, "A", "0123456789"); // truncated to 5
+        st.push_header(&cfg, "B", "2");
+        st.push_header(&cfg, "C", "3");
+        st.push_header(&cfg, "D", "4"); // dropped, cap reached
+        assert_eq!(st.headers.len(), 3);
+        assert_eq!(st.headers[0].1, "01234");
+        assert_eq!(
+            st.header_bytes,
+            "A".len() + 5 + "B".len() + 1 + "C".len() + 1
+        );
+
+        // body cap: exact fit then truncation
+        let mut st = MailState::default();
+        st.push_body(&cfg, b"0123456789"); // exactly 10
+        assert!(!st.body_truncated);
+        st.push_body(&cfg, b"x"); // one byte too many
+        assert!(st.body_truncated);
+        assert_eq!(st.body.len(), 10);
+    }
+
+    #[test]
+    fn record_stats_counts_all_outcome_shapes() {
+        let stats = dashboard::Stats::new();
+
+        // spam: one ok spam, one ok ham, one error
+        record_stats(
+            &stats,
+            "q1",
+            "<a@x>",
+            true,
+            false,
+            false,
+            &[
+                outcome("m1", true, 0.9),
+                outcome("m2", false, 0.1),
+                failed("m3"),
+            ],
+        );
+        let v = stats.snapshot_json(0);
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["spam"], 1);
+        assert_eq!(v["ham"], 0);
+        assert_eq!(v["per_model"]["m1"]["ok"], 1);
+        assert_eq!(v["per_model"]["m1"]["spam"], 1);
+        assert_eq!(v["per_model"]["m2"]["spam"], 0);
+        assert_eq!(v["per_model"]["m3"]["errors"], 1);
+        // recent entry carries the queue id, sender and model chips
+        assert_eq!(v["recent"][0]["queue_id"], "q1");
+        assert_eq!(v["recent"][0]["sender"], "<a@x>");
+        assert_eq!(v["recent"][0]["models"][0]["name"], "m1");
+
+        // whitelisted: no model rows, counted as ham
+        record_stats(&stats, "q2", "b@x", false, true, false, &[]);
+        let v = stats.snapshot_json(0);
+        assert_eq!(v["whitelisted"], 1);
+        assert_eq!(v["ham"], 1);
+        assert_eq!(v["recent"][0]["whitelisted"], true);
+        assert_eq!(v["recent"][0]["summary"], "whitelisted");
+
+        // temperror: all models failed -> counted as ham (fail-open)
+        record_stats(&stats, "q3", "c@x", false, false, true, &[failed("m1")]);
+        let v = stats.snapshot_json(0);
+        assert_eq!(v["temperror"], 1);
+        assert_eq!(v["ham"], 2);
+        assert_eq!(v["recent"][0]["temperror"], true);
+
+        // ring buffer is bounded at 100
+        for i in 0..150 {
+            record_stats(&stats, &format!("q{i}"), "s@x", false, false, true, &[]);
+        }
+        let v = stats.snapshot_json(0);
+        assert_eq!(v["recent"].as_array().unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn append_eval_log_creates_parent_and_appends() {
+        let dir = unique_tmp("eval");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = test_config();
+        // nested, non-existent parent: must be created
+        cfg.eval_log = dir.join("nested/deeper/eval.jsonl");
+
+        append_eval_log(&cfg, &serde_json::json!({"a": 1})).await;
+        append_eval_log(&cfg, &serde_json::json!({"a": 2})).await;
+
+        let content = std::fs::read_to_string(&cfg.eval_log).expect("eval log written");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "appends, never truncates: {content}");
+        assert!(lines[0].contains("\"a\":1"));
+        assert!(lines[1].contains("\"a\":2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_eval_log_unwritable_path_is_survivable() {
+        let mut cfg = test_config();
+        // a file where a directory is expected -> create_dir_all fails; must not panic
+        let blocker = unique_tmp("blocker").with_extension("jsonl");
+        std::fs::write(&blocker, b"x").unwrap();
+        cfg.eval_log = blocker.join("child/eval.jsonl");
+        append_eval_log(&cfg, &serde_json::json!({"a": 1})).await; // must not panic
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
@@ -1498,10 +2144,18 @@ mod tests {
         assert!(is_sender_whitelisted(&cfg, "<a@example.com>", &[]));
         assert!(is_sender_whitelisted(&cfg, "a@dept.example.com", &[]));
         assert!(is_sender_whitelisted(&cfg, "<a@MAIL.example.com>", &[]));
-        assert!(is_sender_whitelisted(&cfg, "<a@sub.mail.dept.example.com>", &[]));
+        assert!(is_sender_whitelisted(
+            &cfg,
+            "<a@sub.mail.dept.example.com>",
+            &[]
+        ));
         // lookalike domains must not match
         assert!(!is_sender_whitelisted(&cfg, "<a@notexample.com>", &[]));
-        assert!(!is_sender_whitelisted(&cfg, "<a@example.com.attacker.com>", &[]));
+        assert!(!is_sender_whitelisted(
+            &cfg,
+            "<a@example.com.attacker.com>",
+            &[]
+        ));
         assert!(!is_sender_whitelisted(&cfg, "<a@gmail.com>", &[]));
         assert!(!is_sender_whitelisted(&cfg, "<>", &[]));
     }
@@ -1530,9 +2184,15 @@ mod tests {
         )
         .unwrap();
         let domains = fc.whitelist.unwrap().sender_domains.unwrap();
-        assert_eq!(domains, vec!["example.com", "Mail.Example.COM", " .sub.example.com. "]);
+        assert_eq!(
+            domains,
+            vec!["example.com", "Mail.Example.COM", " .sub.example.com. "]
+        );
         // normalize_domain cleans up
         let norm: Vec<String> = domains.iter().map(|s| normalize_domain(s)).collect();
-        assert_eq!(norm, vec!["example.com", "mail.example.com", "sub.example.com"]);
+        assert_eq!(
+            norm,
+            vec!["example.com", "mail.example.com", "sub.example.com"]
+        );
     }
 }

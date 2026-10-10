@@ -7,7 +7,7 @@ on:
     branches: [main, master]
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   BIN: ai-classification-milter
@@ -63,3 +63,32 @@ jobs:
           name: ${{ matrix.out }}
           path: dist/${{ matrix.out }}
           if-no-files-found: error
+
+  release-current:
+    name: release (current)
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Stage release files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/ai-classification-milter-linux-amd64/ai-classification-milter-linux-amd64" \
+            "release/ai-classification-milter-linux-amd64"
+          cp "dist/ai-classification-milter-macos-arm64/ai-classification-milter-macos-arm64" \
+            "release/ai-classification-milter-macos-arm64"
+          chmod +x release/*
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          ls -la release/
+          cat release/SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: current
+          name: current (rolling WIP build)
+          body: Rolling build from latest successful push to main. Updated on every push; artifacts are overwritten.
+          prerelease: true
+          files: release/*

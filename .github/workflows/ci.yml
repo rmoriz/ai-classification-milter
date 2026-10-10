@@ -3,12 +3,11 @@ name: CI
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
   pull_request:
     branches: [main, master]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   BIN: ai-classification-milter
@@ -64,30 +63,3 @@ jobs:
           name: ${{ matrix.out }}
           path: dist/${{ matrix.out }}
           if-no-files-found: error
-
-  release:
-    name: release
-    needs: build
-    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-      - name: Rename with tag version
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          mkdir -p release
-          cp "dist/ai-classification-milter-linux-amd64/ai-classification-milter-linux-amd64" \
-            "release/${{ env.BIN }}-${TAG}-linux-amd64"
-          cp "dist/ai-classification-milter-macos-arm64/ai-classification-milter-macos-arm64" \
-            "release/${{ env.BIN }}-${TAG}-macos-arm64"
-          chmod +x release/*
-          ls -la release/
-          sha256sum release/* > release/SHA256SUMS.txt
-          cat release/SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true

@@ -20,6 +20,8 @@ use std::{
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+mod dashboard;
+
 // ---------------------------------------------------------------- config
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,9 @@ pub struct AppConfig {
     pub log_all_mails: bool, // true = log every mail as .eml (eval), otherwise only spam
     pub learn_mode: bool,    // true = never reject, only tag + log
     pub whitelist_sender_domains: Vec<String>, // lowercase, no leading dot; subdomains match too
+    pub dashboard_enabled: bool,
+    pub dashboard_listen: String, // own socket, e.g. 127.0.0.1:8892
+    pub dashboard_token: Option<String>, // if set, required as ?token= or Bearer
 }
 
 const DEFAULT_OPENROUTER_MODELS: &str = "microsoft/microsoft-decision-1,cloudflare/clef-omni,upstage/solar-decide-flash,nace-ai/drex-v1.5,typesafe/jev-1.13";
@@ -148,6 +153,7 @@ struct FileConfig {
     limits: Option<LimitsSection>,
     logging: Option<LoggingSection>,
     whitelist: Option<WhitelistSection>,
+    dashboard: Option<DashboardSection>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -189,6 +195,13 @@ struct LoggingSection {
 #[derive(Debug, Deserialize, Default)]
 struct WhitelistSection {
     sender_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DashboardSection {
+    enabled: Option<bool>,
+    listen: Option<String>,
+    token: Option<String>,
 }
 
 fn config_path() -> String {
@@ -292,6 +305,14 @@ impl AppConfig {
             .filter(|v: &Vec<String>| !v.is_empty())
             .unwrap_or_default();
 
+        // Dashboard: env > TOML > defaults (default: aus).
+        let dash = fc.dashboard.unwrap_or_default();
+        let dashboard_enabled = bool_val(env("DASHBOARD_ENABLED"), dash.enabled, false);
+        let dashboard_listen = env("DASHBOARD_LISTEN")
+            .or(dash.listen)
+            .unwrap_or_else(|| "127.0.0.1:8892".into());
+        let dashboard_token = env("DASHBOARD_TOKEN").or(dash.token).filter(|t| !t.is_empty());
+
         Self {
             listen: env("MILTER_LISTEN").or(fc.listen).unwrap_or_else(|| "127.0.0.1:8891".into()),
             models,
@@ -317,6 +338,9 @@ impl AppConfig {
             log_all_mails: bool_val(env("LOG_ALL_MAILS"), log.log_all_mails, false),
             learn_mode: bool_val(env("LEARN_MODE"), log.learn_mode, true),
             whitelist_sender_domains,
+            dashboard_enabled,
+            dashboard_listen,
+            dashboard_token,
         }
     }
 }
@@ -756,9 +780,50 @@ fn verdict_tag(outcomes: &[ModelOutcome]) -> String {
 
 // ------------------------------------------------------------------ logging
 
+/// Feed the dashboard counters. Cheap + infallible (lock poisoning is ignored).
+fn record_stats(
+    stats: &dashboard::Stats,
+    queue_id: &str,
+    sender: &str,
+    spam: bool,
+    whitelisted: bool,
+    temperror: bool,
+    outcomes: &[ModelOutcome],
+) {
+    let models: Vec<(String, bool, f32, u64, Option<f64>, bool)> = outcomes
+        .iter()
+        .map(|o| (o.model.clone(), o.is_spam, o.verdict.score, o.latency_ms, o.cost_usd, o.error.is_some()))
+        .collect();
+    stats.record(
+        dashboard::RecentEntry {
+            ts: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            queue_id: queue_id.to_string(),
+            sender: sender.to_string(),
+            spam,
+            whitelisted,
+            temperror,
+            summary: if outcomes.is_empty() {
+                if whitelisted { "whitelisted".into() } else { "temperror".into() }
+            } else {
+                verdict_tag(outcomes)
+            },
+        },
+        &models,
+    );
+}
+
 async fn append_eval_log(cfg: &AppConfig, line: &serde_json::Value) {
     use tokio::io::AsyncWriteExt;
     let s = serde_json::to_string(line).unwrap_or_default();
+    // Parent anlegen (z.B. /var/lib/ai-classification-milter existiert frisch noch nicht).
+    if let Some(parent) = cfg.eval_log.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                warn!(error = %e, "eval log parent create failed");
+                return;
+            }
+        }
+    }
     match tokio::fs::OpenOptions::new().create(true).append(true).open(&cfg.eval_log).await {
         Ok(mut f) => {
             if let Err(e) = f.write_all(format!("{s}\n").as_bytes()).await {
@@ -961,13 +1026,33 @@ async fn main() -> std::io::Result<()> {
     if stdin_mode {
         return run_cli(&cfg, json_out).await;
     }
+    let stats = dashboard::Stats::new();
     info!(
         listen = %cfg.listen,
         models = ?cfg.models.iter().map(|m| &m.name).collect::<Vec<_>>(),
         learn_mode = cfg.learn_mode,
         whitelist_sender_domains = ?cfg.whitelist_sender_domains,
+        dashboard_enabled = cfg.dashboard_enabled,
+        dashboard_listen = %cfg.dashboard_listen,
         "ai-classification-milter starting"
     );
+
+    // Optional dashboard (own socket, default off). Runs as background task;
+    // failure to bind must not kill the milter — just log it.
+    if cfg.dashboard_enabled {
+        let dcfg = cfg.clone();
+        let dstats = stats.clone();
+        tokio::spawn(async move {
+            let opts = dashboard::DashboardOpts {
+                stats: dstats,
+                spam_dir: dcfg.log_spam_dir.clone(),
+                token: dcfg.dashboard_token.clone(),
+            };
+            if let Err(e) = dashboard::serve(dcfg.dashboard_listen.clone(), opts).await {
+                warn!(error = %e, "dashboard failed");
+            }
+        });
+    }
 
     let cbs = Callbacks::<MailState>::new()
         .on_mail(|ctx: &mut Context<MailState>, args: Vec<CString>| {
@@ -1019,8 +1104,10 @@ async fn main() -> std::io::Result<()> {
         })
         .on_eom({
             let cfg = cfg.clone();
+            let stats = stats.clone();
             move |ctx: &mut EomContext<MailState>| {
                 let cfg = cfg.clone();
+                let stats = stats.clone();
                 Box::pin(async move {
                     // Everything below is fail-open: no path may panic/reject
                     // without a successful model answer.
@@ -1032,6 +1119,7 @@ async fn main() -> std::io::Result<()> {
                     // Whitelisted sender domain: no model call, accept immediately + tag.
                     if is_sender_whitelisted(&cfg, &state.sender, &state.headers) {
                         info!(queue_id = %queue_id, sender = %state.sender, "whitelisted sender domain, skip LLM");
+                        record_stats(&stats, &queue_id, &state.sender, false, true, false, &[]);
                         append_eval_log(&cfg, &serde_json::json!({
                             "ts": Local::now().to_rfc3339(),
                             "queue_id": queue_id,
@@ -1067,6 +1155,7 @@ async fn main() -> std::io::Result<()> {
                     let ok_count = outcomes.iter().filter(|o| o.error.is_none()).count();
                     let spam = combine(cfg.decision, &outcomes);
                     info!(queue_id = %queue_id, spam = spam, ok = ok_count, total = outcomes.len(), "verdicts");
+                    record_stats(&stats, &queue_id, &state.sender, spam, false, ok_count == 0, &outcomes);
 
                     // Eval log: one JSON line per mail (cheap, no body).
                     append_eval_log(&cfg, &serde_json::json!({
@@ -1172,6 +1261,9 @@ mod tests {
             log_all_mails: false,
             learn_mode: true,
             whitelist_sender_domains: vec!["example.com".into(), "dept.example.com".into()],
+            dashboard_enabled: false,
+            dashboard_listen: "127.0.0.1:0".into(),
+            dashboard_token: None,
         }
     }
 
@@ -1338,6 +1430,26 @@ mod tests {
         assert_eq!(fc.openrouter.unwrap().models.unwrap(), vec!["a/b", "c/d"]);
         assert_eq!(fc.limits.as_ref().unwrap().decision.as_deref(), Some("majority"));
         assert_eq!(fc.logging.unwrap().learn_mode, Some(false));
+    }
+
+    #[test]
+    fn file_config_dashboard_parse() {
+        let fc: FileConfig = toml::from_str(
+            r#"
+            [dashboard]
+            enabled = true
+            listen = "0.0.0.0:8892"
+            token = "s3cret"
+            "#,
+        )
+        .unwrap();
+        let d = fc.dashboard.unwrap();
+        assert_eq!(d.enabled, Some(true));
+        assert_eq!(d.listen.as_deref(), Some("0.0.0.0:8892"));
+        assert_eq!(d.token.as_deref(), Some("s3cret"));
+        // defaults: off
+        let fc2: FileConfig = toml::from_str("").unwrap();
+        assert!(fc2.dashboard.is_none());
     }
 
     #[test]

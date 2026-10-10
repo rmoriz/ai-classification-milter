@@ -41,3 +41,13 @@ learn_mode = true      # true = never reject, only tag + log
 # Sender domains that never reach the models and are accepted immediately
 # (envelope MAIL FROM; subdomains match too, case-insensitive).
 sender_domains = ["example.com", "dept.example.com"]
+
+[dashboard]
+# Optional web UI: stats (/ ) + quarantine browser (/mails) + JSON (/api/*).
+# Own socket, independent from `listen` above. Default: off.
+enabled = false
+listen = "127.0.0.1:8892"   # interface + port. Examples: "127.0.0.1:8892" (local only),
+                             # "<tailscale-ip>:8892" (tailnet only, e.g. 100.x.y.z — no HTTPS needed,
+                             # WireGuard already encrypts). Avoid "0.0.0.0" unless behind a reverse proxy.
+# token = "s3cret"           # if set, required as ?token= or `Authorization: Bearer`
+                             # keep it, even on a tailnet (shared network) — quarantine contains PII!

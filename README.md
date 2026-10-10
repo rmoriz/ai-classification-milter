@@ -90,6 +90,31 @@ nace-ai/drex-v1.5, typesafe/jev-1.13
 See `prompt.md`. Legacy mode (`MODELS=name=url`) for custom
 `{spam,score,reason}` endpoints remains as a fallback.
 
+## Dashboard (optional)
+
+```toml
+[dashboard]
+enabled = true
+listen = "127.0.0.1:8892"   # interface + port, own socket next to the milter port
+# token = "s3cret"           # optional: then required as ?token= or Authorization: Bearer
+```
+
+Or via env: `DASHBOARD_ENABLED=true`, `DASHBOARD_LISTEN=127.0.0.1:8892`,
+`DASHBOARD_TOKEN=s3cret`. No new dependency — tiny built-in HTTP server
+(plain HTTP, no TLS needed on trusted networks).
+
+* `/` — counters since process start (total/spam/ham/whitelisted/temperror),
+  per-model stats (ok/spam/err, avg score/latency, cost) + last 20 mails.
+  Auto-refreshes every 3s via `fetch` polling of `/api/stats` (no WebSocket/SSE).
+* `/mails?q=&limit=&offset=` — browse the quarantine (`spam_dir`), newest first,
+  search by sender/filename, detail view with meta + `.eml` preview + raw download.
+* `/api/stats`, `/api/mails`, `/api/mails/<stem>` — same as JSON.
+
+Caution: the quarantine contains PII — keep it on `127.0.0.1` or behind a reverse
+proxy with auth; set `token` whenever the port isn't local-only. For Tailscale/Netbird:
+bind `listen` to the tailnet IP (e.g. `100.x.y.z:8892`) — HTTPS is unnecessary there
+(WireGuard already encrypts), but still set `token` (shared network).
+
 ## Notes
 
 * Body is received from the start (`on_body`), but capped (`body_max_bytes`,

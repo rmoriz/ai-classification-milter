@@ -333,10 +333,39 @@ Off by default; enable with `enabled = true` in the `[dashboard]` section above.
 | --- | --- |
 | `/` | Counters since start, per-model stats, last mails; auto-refreshes every 3s |
 | `/mails` | Quarantine browser: search, detail view, raw download |
+| `POST /mails/<stem>/release` | Re-deliver a false positive (needs `release = true`) |
 | `/api/stats`, `/api/mails`, `/api/mails/<stem>` | The same data as JSON |
+
+**Release (false positives).** With `release = true` each spam row in `/mails` gets a
+*Deliver anyway* button. It hands the message back to the MTA via `sendmail`, which
+enters through `pickup` — and since milters do not see `pickup`, the released mail is
+**not filtered again**. That also means no allow-list entry is needed.
+
+The mail is stamped with `X-AIClassifier-Released: <ts> by dashboard` and an audit
+entry (`"event":"released"`) is appended to `eval.jsonl`.
+
+Guardrails, because delivering a quarantined mail is irreversible:
+
+* Off by default, and independent of `enabled` — it is its own switch.
+* **POST only**, behind a `confirm()` in the browser. A link, a prefetch or a click
+  in a screenshot cannot trigger it.
+* Reuses the same token auth as everything else.
+* The message goes to `sendmail` over stdin and every argument is a separate `exec`
+  argument — no shell, so a crafted envelope sender cannot inject options or headers.
+  Senders containing whitespace, CR/LF or without `@` are refused outright.
+* Override the binary with `MILTER_SENDMAIL_CMD` (absolute path, no arguments) if it
+  is not at `/usr/sbin/sendmail`.
 
 Model results render as colored chips (`jev-1.13 · SPAM 0.96`) instead of a dense string,
 in the UI and in the JSON (`models[]`).
+
+The detail view shows the mail as **source** in a scroll container (never rendered as
+HTML, so no remote content is loaded). Double-click selects the whole message; the
+`copy exact` button fetches `/mails/<stem>/raw` and puts it on the clipboard.
+
+> Use **copy exact** for pasting elsewhere. Copying straight from the page is fine for
+> reading, but the browser normalises CRLF to LF in the rendered text, which subtly
+> changes a mail. The `wrap` toggle is purely visual.
 
 `scramble_senders` blurs addresses in HTML (CSS) and masks them as `•••@•••` in JSON —
 screenshot hygiene, not access control. The `Scramble: on/off` link toggles it live via

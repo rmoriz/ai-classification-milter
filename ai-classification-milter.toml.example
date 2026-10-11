@@ -52,4 +52,8 @@ listen = "127.0.0.1:8892"   # interface + port. Examples: "127.0.0.1:8892" (loca
 # token = "s3cret"           # if set, required as ?token= or `Authorization: Bearer`
                              # keep it, even on a tailnet (shared network) — quarantine contains PII!
 # scramble_senders = false   # blur sender addresses in the web view (CSS) for safe screenshots;
-                             # also toggleable live via the "Scramble: an/aus" link (?scramble=1/0)
+                             # also toggleable live via the "Scramble: on/off" link (?scramble=1/0)
+# release = false            # "Deliver anyway" button for false positives. Re-injects the
+                             # quarantined mail via sendmail (pickup, so the milter does not
+                             # see it again). Adds X-AIClassifier-Released and an eval.jsonl
+                             # entry. Keep off unless you trust everyone with dashboard access.

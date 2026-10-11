@@ -65,6 +65,7 @@ struct AppConfig {
     pub dashboard_listen: String, // own socket, e.g. 127.0.0.1:8892
     pub dashboard_token: Option<String>, // if set, required as ?token= or Bearer
     pub dashboard_scramble_senders: bool, // blur sender addresses in HTML views
+    pub dashboard_release: bool,  // "deliver anyway" button for false positives
 }
 
 const DEFAULT_OPENROUTER_MODELS: &str = "microsoft/microsoft-decision-1,cloudflare/clef-omni,upstage/solar-decide-flash,nace-ai/drex-v1.5,typesafe/jev-1.13";
@@ -217,6 +218,7 @@ struct DashboardSection {
     listen: Option<String>,
     token: Option<String>,
     scramble_senders: Option<bool>,
+    release: Option<bool>,
 }
 
 fn config_path() -> String {
@@ -389,6 +391,9 @@ impl AppConfig {
             dash.scramble_senders,
             false,
         );
+        // Off by default: delivering a quarantined mail is irreversible, so it
+        // stays behind its own switch even when the dashboard is enabled.
+        let dashboard_release = bool_val(env("DASHBOARD_RELEASE"), dash.release, false);
 
         Self {
             listen: env("MILTER_LISTEN")
@@ -449,6 +454,7 @@ impl AppConfig {
             dashboard_listen,
             dashboard_token,
             dashboard_scramble_senders,
+            dashboard_release,
         }
     }
 }
@@ -1322,6 +1328,13 @@ async fn main() -> std::io::Result<()> {
                 spam_dir: dcfg.log_spam_dir.clone(),
                 token: dcfg.dashboard_token.clone(),
                 scramble_senders: dcfg.dashboard_scramble_senders,
+                release_enabled: dcfg.dashboard_release,
+                eval_log: Some(dcfg.eval_log.clone()),
+                // Loaded once at startup, so the first page view is fast even
+                // with a large quarantine, and it survives a restart.
+                cache: Arc::new(std::sync::Mutex::new(dashboard::QuarantineCache::load(
+                    &dcfg.log_spam_dir,
+                ))),
             };
             if let Err(e) = dashboard::serve(dcfg.dashboard_listen.clone(), opts).await {
                 warn!(error = %e, "dashboard failed");
@@ -1563,6 +1576,7 @@ mod tests {
             dashboard_listen: "127.0.0.1:0".into(),
             dashboard_token: None,
             dashboard_scramble_senders: false,
+            dashboard_release: false,
         }
     }
 

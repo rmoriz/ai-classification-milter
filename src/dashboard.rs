@@ -69,7 +69,7 @@ pub struct RecentEntry {
 pub type ModelRow = (String, bool, f32, u64, Option<f64>, bool);
 
 /// One model result for chip rendering (overview + quarantine list).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelChip {
     pub name: String, // shortened, e.g. "jev-1.13"
     pub spam: bool,
@@ -307,7 +307,7 @@ impl Stats {
 
 // ------------------------------------------------------------ quarantine scan
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QuarantineMail {
     pub stem: String,
     pub mtime_unix: u64,
@@ -336,14 +336,329 @@ fn is_eml(e: &std::io::Result<std::fs::DirEntry>) -> bool {
         .unwrap_or(false)
 }
 
+// ------------------------------------------------------------------ release
+//
+// A quarantined mail that turns out to be a false positive has to go out after
+// all. A milter cannot inject mail (the protocol has no such verb and the queue
+// belongs to Postfix), so the dashboard hands the message back to the MTA via
+// `sendmail` (pickup). Pickup does not pass milters, so the message cannot be
+// filtered a second time — no loop, no allow-list needed.
+//
+// Safety: the message goes in over stdin and every argument is passed as a
+// separate exec argument, so no shell is involved and a crafted envelope sender
+// cannot inject options or extra headers.
+
+/// Path to the local MTA delivery command. Override with `MILTER_SENDMAIL_CMD`
+/// (absolute path, no arguments).
+const DEFAULT_SENDMAIL: &str = "/usr/sbin/sendmail";
+
+fn sendmail_cmd() -> String {
+    std::env::var("MILTER_SENDMAIL_CMD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SENDMAIL.to_string())
+}
+
+/// Reject anything that could smuggle an option or a second header into the
+/// `sendmail` invocation. Returns None for a usable address.
+fn sanitize_envelope(addr: &str) -> Option<String> {
+    let a = addr.trim();
+    if a.is_empty() || a.contains(['\n', '\r', '\0', ' ', '\t']) {
+        return None;
+    }
+    // Must look like an address; anything else is refused outright.
+    if !a.contains('@') {
+        return None;
+    }
+    Some(a.to_string())
+}
+
+#[derive(Debug)]
+pub enum ReleaseError {
+    /// Bad input from the request (stem traversal, hostile envelope, ...).
+    Invalid(String),
+    /// The MTA refused or is not installed.
+    Delivery(String),
+}
+
+/// Re-inject a quarantined mail. Returns the sender used.
+pub fn release_mail(
+    dir: &Path,
+    stem: &str,
+    eval_log: Option<&Path>,
+) -> Result<String, ReleaseError> {
+    // read_mail already rejects traversal; reuse it as the single gate.
+    let (meta, eml) = read_mail(dir, stem)
+        .ok_or_else(|| ReleaseError::Invalid(format!("unknown mail: {stem}")))?;
+    let meta_v: serde_json::Value = serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
+    let raw_from = meta_v
+        .get("envelope_from")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let from = match sanitize_envelope(&raw_from) {
+        Some(f) => f,
+        None => {
+            // Empty envelope (bounces) cannot be re-injected safely.
+            return Err(ReleaseError::Invalid(format!(
+                "unusable envelope sender: {raw_from:?}"
+            )));
+        }
+    };
+
+    // Stamp the release so the trail survives on the delivered mail.
+    let stamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+    let note =
+        format!("X-AIClassifier-Released: {stamp} by dashboard (false positive, re-injected)\r\n");
+    let mut payload = note.into_bytes();
+    payload.extend_from_slice(eml.as_bytes());
+
+    let mut cmd = std::process::Command::new(sendmail_cmd());
+    cmd.arg("-i") // dot-stuffing off: we deliver a complete message
+        .arg("-oi")
+        .arg("-f")
+        .arg(&from)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(ReleaseError::Delivery(format!(
+                "cannot run {}: {e}",
+                sendmail_cmd()
+            )))
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Err(e) = stdin.write_all(&payload) {
+            let _ = child.wait();
+            return Err(ReleaseError::Delivery(format!(
+                "write to sendmail failed: {e}"
+            )));
+        }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Err(ReleaseError::Delivery(format!("sendmail wait failed: {e}"))),
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(ReleaseError::Delivery(format!(
+            "sendmail exited {}: {}",
+            out.status,
+            err.trim().chars().take(200).collect::<String>()
+        )));
+    }
+
+    // Audit trail next to the eval log: who released what, from where.
+    if let Some(log) = eval_log {
+        let line = serde_json::json!({
+            "ts": stamp.to_string(),
+            "event": "released",
+            "stem": stem,
+            "envelope_from": from,
+            "score": meta_v.get("outcomes")
+                .and_then(|o| o.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("score").and_then(|s| s.as_f64()))
+                        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+                }),
+        });
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()));
+    }
+    Ok(from)
+}
+
+// ------------------------------------------------------------ quarantine cache
+//
+// Parsing every sidecar JSON on every request is wasteful once the quarantine
+// holds more than a handful of mails. The cache lives next to the data (inside
+// `spam_dir`) so it survives a restart and can simply be deleted to force a
+// rebuild.
+//
+// Versioning: `CACHE_VERSION` is part of the stored payload. Bump it whenever
+// the sidecar format or the parsing changes — an older cache is then discarded
+// and rebuilt from the current files instead of serving stale data.
+
+const CACHE_VERSION: u32 = 2;
+const CACHE_FILE: &str = ".dashboard-cache.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CacheEntry {
+    /// Stamp of the **sidecar JSON**, because that is what we parsed. Keying
+    /// on the `.eml` instead would miss a sidecar-only rewrite and serve stale
+    /// scores. Nanoseconds to avoid same-second collisions.
+    pub sidecar_mtime_nanos: u128,
+    pub sidecar_size: u64,
+    pub mail: QuarantineMail,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CacheFile {
+    version: u32,
+    entries: std::collections::HashMap<String, CacheEntry>,
+}
+
+/// In-memory cache of parsed sidecars, keyed by mail stem.
+#[derive(Debug, Default)]
+pub struct QuarantineCache {
+    entries: std::collections::HashMap<String, CacheEntry>,
+    dirty: bool,
+    /// Path of the on-disk cache file (inside spam_dir).
+    path: Option<PathBuf>,
+}
+
+impl QuarantineCache {
+    /// Load from disk. A version mismatch or corrupt file starts an empty
+    /// cache instead of failing — the quarantine is the source of truth.
+    pub fn load(dir: &Path) -> Self {
+        let path = dir.join(CACHE_FILE);
+        let mut c = QuarantineCache {
+            entries: Default::default(),
+            dirty: false,
+            path: Some(path.clone()),
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return c;
+        };
+        match serde_json::from_str::<CacheFile>(&raw) {
+            Ok(f) if f.version == CACHE_VERSION => {
+                tracing::info!(entries = f.entries.len(), "dashboard cache loaded");
+                c.entries = f.entries;
+            }
+            Ok(f) => {
+                tracing::info!(
+                    found = f.version,
+                    expected = CACHE_VERSION,
+                    "dashboard cache version changed, discarding"
+                );
+                // Don't delete the file here: it may belong to a rollback.
+                // Just ignore it and overwrite on the next save.
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "dashboard cache unreadable, rebuilding");
+            }
+        }
+        c
+    }
+
+    /// Cached parse, or `None` when the sidecar changed since it was cached.
+    fn get(&self, stem: &str, stamp: (u128, u64)) -> Option<&QuarantineMail> {
+        let e = self.entries.get(stem)?;
+        if e.sidecar_mtime_nanos == stamp.0 && e.sidecar_size == stamp.1 {
+            Some(&e.mail)
+        } else {
+            None
+        }
+    }
+
+    fn put(&mut self, stamp: (u128, u64), mail: QuarantineMail) {
+        let stem = mail.stem.clone();
+        self.entries.insert(
+            stem,
+            CacheEntry {
+                sidecar_mtime_nanos: stamp.0,
+                sidecar_size: stamp.1,
+                mail,
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// Drop entries whose `.eml` no longer exists (retention/rotation).
+    fn retain_existing(&mut self, live: &std::collections::HashSet<String>) {
+        let before = self.entries.len();
+        self.entries.retain(|k, _| live.contains(k));
+        if self.entries.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// Persist if changed. Failure is logged, never fatal: the cache is an
+    /// optimisation, not a source of truth.
+    pub fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let file = CacheFile {
+            version: CACHE_VERSION,
+            entries: std::mem::take(&mut self.entries),
+        };
+        // Build the payload before touching the file so a serialization
+        // failure cannot wipe the in-memory cache.
+        match serde_json::to_vec(&file) {
+            Ok(bytes) => {
+                if let Err(e) = atomic_write(&path, &bytes) {
+                    tracing::warn!(error = %e, "dashboard cache write failed");
+                    self.entries = file.entries; // restore
+                    return;
+                }
+                self.entries = file.entries;
+                self.dirty = false;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "dashboard cache serialize failed");
+                self.entries = file.entries; // restore
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Write via a temp file + rename so a crash mid-write cannot leave a
+/// half-written cache behind.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// (mtime in nanos since epoch, size) of the sidecar JSON. (0, 0) when missing,
+/// which is a stable key so a missing sidecar stays cached as "no data".
+fn sidecar_stamp(dir: &Path, stem: &str) -> (u128, u64) {
+    std::fs::metadata(dir.join(format!("{stem}.json")))
+        .map(|m| {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (t, m.len())
+        })
+        .unwrap_or((0, 0))
+}
+
 /// List quarantined mails, newest first. `q` filters stem/sender substring (case-insensitive).
 pub fn list_quarantine(
     dir: &Path,
     q: &str,
     limit: usize,
     offset: usize,
+    cache: &mut QuarantineCache,
 ) -> (Vec<QuarantineMail>, usize) {
     let mut all: Vec<QuarantineMail> = Vec::new();
+    let mut live = std::collections::HashSet::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return (Vec::new(), 0),
@@ -377,18 +692,31 @@ pub fn list_quarantine(
                 (t, m.len())
             })
             .unwrap_or((0, 0));
-        let (sender, spam, verdict, summary, models) = read_sidecar_json(dir, &stem);
-        all.push(QuarantineMail {
-            stem,
-            mtime_unix,
-            size,
-            sender,
-            spam,
-            verdict,
-            summary,
-            models,
-        });
+        live.insert(stem.clone());
+
+        // Fast path: unchanged sidecar -> reuse the parsed result.
+        let stamp = sidecar_stamp(dir, &stem);
+        let mail = match cache.get(&stem, stamp) {
+            Some(m) => m.clone(),
+            None => {
+                let (sender, spam, verdict, summary, models) = read_sidecar_json(dir, &stem);
+                let m = QuarantineMail {
+                    stem: stem.clone(),
+                    mtime_unix,
+                    size,
+                    sender,
+                    spam,
+                    verdict,
+                    summary,
+                    models,
+                };
+                cache.put(stamp, m.clone());
+                m
+            }
+        };
+        all.push(mail);
     }
+    cache.retain_existing(&live);
     all.sort_by(|a, b| b.mtime_unix.cmp(&a.mtime_unix).then(a.stem.cmp(&b.stem)));
     if !q.is_empty() {
         let ql = q.to_lowercase();
@@ -435,9 +763,12 @@ fn read_sidecar_json(
                 name: short_model(model),
                 spam: o.get("is_spam").and_then(|x| x.as_bool()).unwrap_or(false),
                 err: o.get("error").and_then(|x| x.as_str()).is_some(),
+                // ModelOutcome serializes LlmVerdict with #[serde(flatten)],
+                // so `score` sits at the top level. Accept a nested object too
+                // so hand-written or older sidecars still parse.
                 score: o
-                    .get("verdict")
-                    .and_then(|x| x.get("score"))
+                    .get("score")
+                    .or_else(|| o.get("verdict").and_then(|v| v.get("score")))
                     .and_then(|x| x.as_f64())
                     .unwrap_or(0.0) as f32,
             }
@@ -467,16 +798,36 @@ fn read_sidecar_json(
     (sender, spam, verdict, summary, models)
 }
 
+/// Cap for the in-page source preview so one huge mail cannot blow up the page.
+pub const PREVIEW_LIMIT: usize = 200_000;
+
+/// Read meta + the *full* message. Used by `/raw`, which must never truncate:
+/// the whole point of that route is getting the untouched file.
+pub fn read_mail_raw(dir: &Path, stem: &str) -> Option<(String, String)> {
+    let eml = read_eml(dir, stem)?;
+    let meta =
+        std::fs::read_to_string(dir.join(format!("{stem}.json"))).unwrap_or_else(|_| "{}".into());
+    Some((meta, eml))
+}
+
+/// Read meta + a preview capped at `PREVIEW_LIMIT`, for the HTML view.
 pub fn read_mail(dir: &Path, stem: &str) -> Option<(String, String)> {
+    let eml = read_eml(dir, stem)?;
+    let meta =
+        std::fs::read_to_string(dir.join(format!("{stem}.json"))).unwrap_or_else(|_| "{}".into());
+    let text =
+        String::from_utf8_lossy(&eml.as_bytes()[..eml.len().min(PREVIEW_LIMIT)]).into_owned();
+    Some((meta, text))
+}
+
+/// Shared traversal guard + read. Returns the lossless message as a String.
+fn read_eml(dir: &Path, stem: &str) -> Option<String> {
     if stem.contains('/') || stem.contains('\\') || stem.contains("..") {
         return None;
     }
-    let eml = std::fs::read(dir.join(format!("{stem}.eml"))).ok()?;
-    let meta =
-        std::fs::read_to_string(dir.join(format!("{stem}.json"))).unwrap_or_else(|_| "{}".into());
-    // Cap preview at ~200KB so a huge mail doesn't blow up the page.
-    let text = String::from_utf8_lossy(&eml[..eml.len().min(200_000)]).into_owned();
-    Some((meta, text))
+    std::fs::read(dir.join(format!("{stem}.eml")))
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 // ------------------------------------------------------------------ http utils
@@ -589,6 +940,16 @@ tr:last-child td{border-bottom:none}\
 .dot.off{color:#dc2626}\
 a{color:#1d4ed8}\
 pre{background:#0f1a2e;color:#dbe7ff;padding:1rem;border-radius:12px;overflow:auto;white-space:pre-wrap;font-size:.8rem}\
+.src{position:relative}\
+.src .body{white-space:pre;overflow-x:auto;max-height:72vh;user-select:all;\
+-webkit-user-select:all;cursor:text}\
+.src .body.wrap{white-space:pre-wrap;overflow-x:hidden}\
+.src .bar{display:flex;gap:.6rem;align-items:center;justify-content:space-between;\
+background:#e8eef7;color:#33415c;font-size:.76rem;padding:.35rem .6rem;border-radius:10px 10px 0 0}\
+.src .bar button{padding:.2rem .6rem;font-size:.72rem}\
+p.warn{background:#fef3c7;border:1px solid #fde68a;color:#92400e;\
+padding:.5rem .7rem;border-radius:8px;font-size:.82rem}\
+::selection{background:#93c5fd;color:#0b1220}\
 form{display:flex;gap:.5rem;margin:1rem 0;flex-wrap:wrap}\
 input[type=text]{padding:.45rem .6rem;width:300px;border:1px solid #cbd5e1;border-radius:8px}\
 button{padding:.45rem 1rem;border:none;border-radius:8px;background:#1d4ed8;color:#fff;font-weight:600;cursor:pointer}\
@@ -765,6 +1126,13 @@ pub struct DashboardOpts {
     pub spam_dir: PathBuf,
     pub token: Option<String>,
     pub scramble_senders: bool, // config default; ?scramble=1/0 overrides per request
+    /// Parsed-sidecar cache. Mutated on read, so it is shared behind a Mutex
+    /// across the request handlers spawned by `serve`.
+    pub cache: Arc<std::sync::Mutex<QuarantineCache>>,
+    /// Where release audit entries are appended (eval.jsonl). None disables it.
+    pub eval_log: Option<PathBuf>,
+    /// Master switch for the "deliver anyway" button.
+    pub release_enabled: bool,
 }
 
 fn authorized(headers: &str, query: &HashMap<String, String>, token: &Option<String>) -> bool {
@@ -798,7 +1166,11 @@ fn resp(status: &str, ctype: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn handle_request(req: &str, opts: &DashboardOpts) -> Vec<u8> {
-    let head_only = req.lines().next().unwrap_or("").split_whitespace().next() == Some("HEAD");
+    let method = req.lines().next().unwrap_or("").split_whitespace().next();
+    if method == Some("POST") {
+        return handle_post(req, opts);
+    }
+    let head_only = method == Some("HEAD");
     let mut out = handle_get(req, opts);
     if head_only {
         if let Some(hdr_end) = out.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -806,6 +1178,63 @@ fn handle_request(req: &str, opts: &DashboardOpts) -> Vec<u8> {
         }
     }
     out
+}
+
+/// POST is only used for the release action — a state change that must never
+/// be triggerable by a link, a prefetch or a screenshot click.
+fn handle_post(req: &str, opts: &DashboardOpts) -> Vec<u8> {
+    let request_line = req.lines().next().unwrap_or("").trim_end_matches('\r');
+    let mut parts = request_line.split_whitespace();
+    let _method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let (path, qs) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
+    let query = parse_query(qs);
+    if !authorized(req, &query, &opts.token) {
+        return resp("401 Unauthorized", "text/plain", b"missing or wrong token");
+    }
+    let path = decode_component(path, false);
+    let Some(stem) = path
+        .strip_prefix("/mails/")
+        .and_then(|s| s.strip_suffix("/release"))
+    else {
+        return resp("404 Not Found", "text/plain", b"not found");
+    };
+    if stem.is_empty() || stem.contains('/') {
+        return resp("404 Not Found", "text/plain", b"not found");
+    }
+    // Feature flag last: a wrong path is a 404 even when release is disabled.
+    if !opts.release_enabled {
+        return resp("403 Forbidden", "text/plain", b"release is disabled");
+    }
+    match release_mail(&opts.spam_dir, stem, opts.eval_log.as_deref()) {
+        Ok(from) => {
+            tracing::info!(stem = %stem, from = %from, "quarantined mail released");
+            let body = format!(
+                "<p><b>Released.</b> {} was handed to the MTA via sendmail (envelope from {}).</p>\
+                 <p>It will not pass the milter again (pickup bypasses milters).</p>\
+                 <p><a href=\"{}\">&larr; back</a></p>",
+                html_escape(stem),
+                html_escape(&from),
+                href_q("/mails", &query, &[])
+            );
+            resp(
+                "200 OK",
+                "text/html; charset=utf-8",
+                page("Released", &body, &query, "", false, "/mails").as_bytes(),
+            )
+        }
+        Err(ReleaseError::Invalid(m)) => {
+            tracing::warn!(stem = %stem, error = %m, "release rejected");
+            resp("400 Bad Request", "text/plain", m.as_bytes())
+        }
+        Err(ReleaseError::Delivery(m)) => {
+            tracing::warn!(stem = %stem, error = %m, "release delivery failed");
+            resp("502 Bad Gateway", "text/plain", m.as_bytes())
+        }
+    }
 }
 
 fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
@@ -874,7 +1303,16 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
         let q = query.get("q").cloned().unwrap_or_default();
         let limit = parse_usize(query.get("limit"), 100).min(500);
         let offset = parse_usize(query.get("offset"), 0);
-        let (items, total) = list_quarantine(&opts.spam_dir, &q, limit, offset);
+        // Parse-heavy: lock only for the cache, never across I/O.
+        let (items, total) = {
+            let mut guard = match opts.cache.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let r = list_quarantine(&opts.spam_dir, &q, limit, offset, &mut guard);
+            guard.save();
+            r
+        };
         if path.starts_with("/api") {
             let body = serde_json::to_string(&serde_json::json!({
                 "total": total, "limit": limit, "offset": offset,
@@ -898,7 +1336,7 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
             items.len(),
             offset
         );
-        body.push_str("<table><tr><th>Date</th><th>File</th><th>Sender</th><th>Verdict</th><th>Models</th></tr>");
+        body.push_str("<table><tr><th>Date</th><th>File</th><th>Sender</th><th>Verdict</th><th>Models</th><th>Action</th></tr>");
         for m in &items {
             let dt = chrono::DateTime::from_timestamp(m.mtime_unix as i64, 0)
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
@@ -908,8 +1346,24 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
             } else {
                 chips_html(&m.models)
             };
+            // Release button: POST only, confirmed in the browser, so a
+            // prefetch or a stray click cannot deliver a quarantined mail.
+            let release_btn = if opts.release_enabled && m.spam == Some(true) {
+                format!(
+                    "<form method=post action=\"{}\" onsubmit=\"return confirm('Release {}? It will be delivered.')\">\
+                     <button class=rel>Deliver anyway</button></form>",
+                    href_q(
+                        &format!("/mails/{}/release", url_encode(&m.stem)),
+                        &query,
+                        &[]
+                    ),
+                    html_escape(&m.stem)
+                )
+            } else {
+                String::new()
+            };
             body.push_str(&format!(
-                "<tr><td>{dt}</td><td><a href=\"{}\">{}</a> ({} KB)</td><td{scr_cls}>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{dt}</td><td><a href=\"{}\">{}</a> ({} KB)</td><td{scr_cls}>{}</td><td>{}</td><td>{}</td><td>{release_btn}</td></tr>",
                 href_q(&format!("/mails/{}", url_encode(&m.stem)), &query, &[]),
                 html_escape(&m.stem),
                 m.size / 1024,
@@ -947,7 +1401,12 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
         if stem.is_empty() || stem.contains('/') {
             return resp("404 Not Found", "text/plain", b"not found");
         }
-        match read_mail(&opts.spam_dir, &stem) {
+        // /raw must serve the complete file, the HTML view may cap the preview.
+        match if raw {
+            read_mail_raw(&opts.spam_dir, &stem)
+        } else {
+            read_mail(&opts.spam_dir, &stem)
+        } {
             Some((_meta, eml)) if raw => {
                 return resp("200 OK", "text/plain; charset=utf-8", eml.as_bytes());
             }
@@ -972,13 +1431,59 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
                     (pretty, eml)
                 };
                 let here = format!("/mails/{}", url_encode(&stem));
+                // Container for the raw source: `user-select:all` makes a
+                // double-click select the whole message, and `white-space:pre`
+                // (not pre-wrap) keeps the copied text byte-identical — soft
+                // wraps would otherwise be pasted in as line breaks.
+                let truncated = if eml.len() >= PREVIEW_LIMIT {
+                    format!(
+                        "<p class=warn>Preview truncated at {} KB &mdash; use <a href=\"{}\">raw .eml</a> for the complete message.</p>",
+                        PREVIEW_LIMIT / 1000,
+                        href_q(&format!("{here}/raw"), &query, &[])
+                    )
+                } else {
+                    String::new()
+                };
                 let body = format!(
                     "<p><a href=\"{}\">&larr; back</a> &middot; <a href=\"{}\">raw .eml</a></p>\
-                    <h2>Meta</h2><pre>{}</pre><h2>Mail</h2><pre>{}</pre>",
+                    <h2>Meta</h2><pre>{}</pre>\
+                    <h2>Mail source</h2>\
+                    <div class=src><div class=bar>\
+                    <span>double-click to select &middot; copy button fetches the byte-exact source</span>\
+                    <span>\
+                    <button type=button id=cpbtn>copy exact</button> \
+                    <button type=button id=wrapbtn>wrap</button></span>\
+                    </div><pre class=body id=mailsrc>{}</pre></div>{truncated}\
+                    <script>\
+                    (function(){{\
+                    var b=document.getElementById('mailsrc');\
+                    document.getElementById('wrapbtn').onclick=function(){{\
+                    b.classList.toggle('wrap');\
+                    this.textContent=b.classList.contains('wrap')?'no wrap':'wrap';}};\
+                    document.getElementById('cpbtn').onclick=async function(){{\
+                    var btn=this;\
+                    try {{\
+                    var r=await fetch('{}',{{cache:'no-store'}});\
+                    var txt=await r.text();\
+                    if(navigator.clipboard&&navigator.clipboard.writeText){{\
+                    await navigator.clipboard.writeText(txt);\
+                    }} else {{\
+                    var ta=document.createElement('textarea');ta.value=txt;\
+                    document.body.appendChild(ta);ta.select();\
+                    document.execCommand('copy');document.body.removeChild(ta);\
+                    }}\
+                    btn.textContent='copied';\
+                    }} catch(e) {{ btn.textContent='copy failed'; }}\
+                    setTimeout(function(){{btn.textContent='copy exact'}},1500);\
+                    }};}})();\
+                    </script>",
                     href_q("/mails", &query, &[]),
                     href_q(&format!("{here}/raw"), &query, &[]),
                     html_escape(&pretty),
-                    html_escape(&eml)
+                    html_escape(&eml),
+                    // Copy pulls from /raw: the rendered HTML normalises CRLF to
+                    // LF, which would corrupt a pasted mail.
+                    href_q(&format!("{here}/raw"), &query, &[])
                 );
                 return resp(
                     "200 OK",
@@ -997,7 +1502,8 @@ fn handle_get(req: &str, opts: &DashboardOpts) -> Vec<u8> {
                 br#"{"error":"not found"}"#,
             );
         }
-        match read_mail(&opts.spam_dir, stem) {
+        // The API is for tooling: serve the complete message.
+        match read_mail_raw(&opts.spam_dir, stem) {
             Some((meta, eml)) => {
                 let meta_v: serde_json::Value =
                     serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
@@ -1098,6 +1604,9 @@ mod tests {
             spam_dir: dir.to_path_buf(),
             token: token.map(str::to_string),
             scramble_senders: scramble,
+            cache: Arc::new(std::sync::Mutex::new(QuarantineCache::load(dir))),
+            eval_log: None,
+            release_enabled: false,
         }
     }
 
@@ -1116,11 +1625,14 @@ mod tests {
             "20240101T000000_q1_spam.eml",
             "From: spammer@evil.com\r\nSubject: win\r\n\r\nbody",
         );
+        // Shape mirrors the real ModelOutcome serde output: LlmVerdict is
+        // #[serde(flatten)]ed, so spam/score/reason are TOP-LEVEL keys.
         td.write(
             "20240101T000000_q1_spam.json",
             r#"{"queue_id":"q1","verdict":"spam","envelope_from":"spammer@evil.com",
-                "outcomes":[{"model":"typesafe/jev-1.13","is_spam":true,
-                             "verdict":{"spam":true,"score":0.95,"reason":"bulk"},"latency_ms":42}]}"#,
+                "outcomes":[{"model":"typesafe/jev-1.13","spam":true,"score":0.95,
+                             "reason":"noul=0.950","error":null,"latency_ms":42,
+                             "cost_usd":0.00012,"is_spam":true}]}"#,
         );
         td.write(
             "20240102T000000_q2_whitelisted.eml",
@@ -1158,6 +1670,9 @@ mod tests {
             spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
             token: None,
             scramble_senders: false,
+            cache: Arc::new(std::sync::Mutex::new(QuarantineCache::default())),
+            eval_log: None,
+            release_enabled: false,
         };
         let get = handle_request("GET /api/stats HTTP/1.1\r\n\r\n", &opts);
         let head = handle_request("HEAD /api/stats HTTP/1.1\r\n\r\n", &opts);
@@ -1184,9 +1699,345 @@ mod tests {
     }
 
     #[test]
+    fn cache_roundtrip_and_invalidation() {
+        let td = quarantine_with_two_mails();
+        // first pass populates the cache (load() sets the on-disk path)
+        let mut c = QuarantineCache::load(td.path());
+        let (_, total) = list_quarantine(td.path(), "", 100, 0, &mut c);
+        assert_eq!(total, 2);
+        assert_eq!(c.len(), 2);
+        c.save();
+        // cache file exists next to the data
+        let cache_file = td.path().join(CACHE_FILE);
+        assert!(cache_file.exists(), "cache persisted for restart");
+
+        // a fresh cache loaded from disk serves the same data (restart-safe)
+        let mut c2 = QuarantineCache::load(td.path());
+        assert_eq!(c2.len(), 2);
+        let (items, total) = list_quarantine(td.path(), "", 100, 0, &mut c2);
+        assert_eq!(total, 2);
+        assert!(
+            (items[0].models[0].score - 0.95).abs() < 1e-6
+                || items
+                    .iter()
+                    .any(|m| (m.models[0].score - 0.95).abs() < 1e-6)
+        );
+
+        // changed sidecar (new score) must invalidate the entry
+        let before = items
+            .iter()
+            .find(|m| m.stem.contains("q1"))
+            .unwrap()
+            .clone();
+        assert!((before.models[0].score - 0.95).abs() < 1e-6);
+        td.write(
+            "20240101T000000_q1_spam.json",
+            r#"{"queue_id":"q1","verdict":"spam","envelope_from":"spammer@evil.com",
+                "outcomes":[{"model":"typesafe/jev-1.13","spam":true,"score":0.42,
+                             "error":null,"latency_ms":40,"is_spam":true}]}"#,
+        );
+        // bump mtime so the (stem,mtime,size) key changes
+        let p = td.path().join("20240101T000000_q1_spam.json");
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+        let (items, _) = list_quarantine(td.path(), "", 100, 0, &mut c2);
+        let after = items.iter().find(|m| m.stem.contains("q1")).unwrap();
+        assert!(
+            (after.models[0].score - 0.42).abs() < 1e-6,
+            "score must refresh, got {}",
+            after.models[0].score
+        );
+    }
+
+    #[test]
+    fn cache_version_mismatch_is_discarded() {
+        let td = quarantine_with_two_mails();
+        // fabricate a cache file from a future version
+        std::fs::write(
+            td.path().join(CACHE_FILE),
+            r#"{"version":999999,"entries":{"x":{"mtime_unix":1,"size":1,
+                "mail":{"stem":"x","mtime_unix":1,"size":1,"sender":"s",
+                        "spam":null,"verdict":null,"summary":"","models":[]}}}}"#,
+        )
+        .unwrap();
+        let mut c = QuarantineCache::load(td.path());
+        assert!(c.is_empty(), "unknown version must start empty");
+        // and it rebuilds from the real files
+        let (_, total) = list_quarantine(td.path(), "", 100, 0, &mut c);
+        assert_eq!(total, 2);
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn cache_corrupt_file_is_ignored() {
+        let td = quarantine_with_two_mails();
+        std::fs::write(td.path().join(CACHE_FILE), "{not json at all").unwrap();
+        let mut c = QuarantineCache::load(td.path());
+        assert!(c.is_empty());
+        let (_, total) = list_quarantine(td.path(), "", 100, 0, &mut c);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn cache_prunes_deleted_mails() {
+        let td = quarantine_with_two_mails();
+        let mut c = QuarantineCache::load(td.path());
+        list_quarantine(td.path(), "", 100, 0, &mut c);
+        assert_eq!(c.len(), 2);
+        // retention deleted one file
+        std::fs::remove_file(td.path().join("20240101T000000_q1_spam.eml")).unwrap();
+        let (_, total) = list_quarantine(td.path(), "", 100, 0, &mut c);
+        assert_eq!(total, 1);
+        assert_eq!(c.len(), 1, "stale entry dropped");
+    }
+
+    #[test]
+    fn cache_survives_restart_with_scores() {
+        // regression guard: the flattened sidecar score must round-trip
+        // through the cache unchanged, not come back as 0.0
+        let td = quarantine_with_two_mails();
+        let mut c = QuarantineCache::load(td.path());
+        list_quarantine(td.path(), "", 100, 0, &mut c);
+        c.save();
+        let c2 = QuarantineCache::load(td.path());
+        let e = c2
+            .entries
+            .get("20240101T000000_q1_spam")
+            .expect("entry cached");
+        assert!(
+            (e.mail.models[0].score - 0.95).abs() < 1e-6,
+            "score lost through the cache: {}",
+            e.mail.models[0].score
+        );
+    }
+
+    #[test]
+    fn sanitize_envelope_rejects_hostile_senders() {
+        assert_eq!(sanitize_envelope("a@b.com").as_deref(), Some("a@b.com"));
+        assert_eq!(sanitize_envelope("  a@b.com  ").as_deref(), Some("a@b.com"));
+        // header injection attempts
+        assert!(sanitize_envelope("a@b.com\nBcc: victim@x.com").is_none());
+        assert!(sanitize_envelope("a@b.com\rX: y").is_none());
+        assert!(sanitize_envelope("a@b.com -OQueueDirectory=/tmp").is_none()); // space splits
+        assert!(sanitize_envelope("a@b.com\0").is_none());
+        assert!(sanitize_envelope("").is_none());
+        assert!(sanitize_envelope("<>").is_none());
+        assert!(sanitize_envelope("notanaddress").is_none());
+    }
+
+    #[test]
+    fn release_is_disabled_by_default() {
+        let td = quarantine_with_two_mails();
+        let mut opts = opts_for(td.path(), None, false);
+        opts.release_enabled = false;
+        let out = handle_request(
+            "POST /mails/20240101T000000_q1_spam/release HTTP/1.1\r\n\r\n",
+            &opts,
+        );
+        let body = String::from_utf8_lossy(&out);
+        assert!(body.contains("403"), "release must be off by default");
+    }
+
+    #[test]
+    fn release_route_requires_auth_and_valid_path() {
+        let td = quarantine_with_two_mails();
+        let mut opts = opts_for(td.path(), Some("t0k3n"), false);
+        opts.release_enabled = true;
+        // no token -> 401
+        let out = handle_request("POST /mails/x_spam/release HTTP/1.1\r\n\r\n", &opts);
+        assert!(String::from_utf8_lossy(&out).contains("401"));
+        // wrong path -> 404 (query string belongs in the request line)
+        let out = handle_request("POST /api/release?token=t0k3n HTTP/1.1\r\n\r\n", &opts);
+        assert!(String::from_utf8_lossy(&out).contains("404"));
+        // traversal in the stem -> 404
+        let out = handle_request(
+            "POST /mails/..%2f..%2fetc/release?token=t0k3n HTTP/1.1\r\n\r\n",
+            &opts,
+        );
+        assert!(String::from_utf8_lossy(&out).contains("404"));
+    }
+
+    #[test]
+    fn release_rejects_unusable_envelope() {
+        let td = TempDir::new("release");
+        td.write("bad.eml", "From: x@y\r\n\r\nbody");
+        // empty envelope sender (a bounce) cannot be re-injected safely
+        td.write(
+            "bad.json",
+            r#"{"verdict":"spam","envelope_from":"","outcomes":[]}"#,
+        );
+        let err = release_mail(td.path(), "bad", None).unwrap_err();
+        assert!(matches!(err, ReleaseError::Invalid(_)), "got {err:?}");
+
+        // unknown mail
+        let err = release_mail(td.path(), "nope", None).unwrap_err();
+        assert!(matches!(err, ReleaseError::Invalid(_)));
+    }
+
+    #[test]
+    fn release_delivers_via_sendmail_and_audits() {
+        let td = quarantine_with_two_mails();
+        // fake sendmail that captures its stdin and argv
+        let shim = td.path().join("fake-sendmail");
+        let captured = td.path().join("captured.eml");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' \"$@\" > '{}'\n",
+                captured.display(),
+                shim.with_file_name("args.txt").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev = std::env::var("MILTER_SENDMAIL_CMD").ok();
+        std::env::set_var("MILTER_SENDMAIL_CMD", &shim);
+
+        let log = td.path().join("eval.jsonl");
+        let from = release_mail(td.path(), "20240101T000000_q1_spam", Some(log.as_path()))
+            .expect("release");
+
+        assert_eq!(from, "spammer@evil.com");
+        let delivered = std::fs::read_to_string(&captured).unwrap();
+        // release marker header is prepended
+        assert!(
+            delivered.starts_with("X-AIClassifier-Released:"),
+            "missing release header: {}",
+            delivered.lines().next().unwrap_or("")
+        );
+        // original mail survives intact
+        assert!(delivered.contains("Subject: win"));
+        assert!(delivered.contains("the body") || delivered.contains("body"));
+        // argv: no shell metacharacters, sender passed as its own argument
+        let args = std::fs::read_to_string(shim.with_file_name("args.txt")).unwrap();
+        assert!(args.contains("spammer@evil.com"), "sender passed via -f");
+        assert!(
+            !args.contains(";") && !args.contains("$("),
+            "no shell in argv"
+        );
+        // audit trail
+        let trail = std::fs::read_to_string(&log).unwrap();
+        assert!(trail.contains("\"event\":\"released\""));
+        assert!(trail.contains("spammer@evil.com"));
+        assert!(trail.contains("20240101T000000_q1_spam"));
+
+        if let Some(p) = prev {
+            std::env::set_var("MILTER_SENDMAIL_CMD", p);
+        }
+    }
+
+    #[test]
+    fn release_button_only_on_spam_and_only_when_enabled() {
+        let td = quarantine_with_two_mails();
+        let stem = "20240101T000000_q1_spam";
+        let wl = "20240102T000000_q2_whitelisted";
+
+        let mut off = opts_for(td.path(), None, false);
+        off.release_enabled = false;
+        let (_, body) = get(&off, "/mails");
+        assert!(!body.contains("Deliver anyway"), "hidden when disabled");
+
+        let mut on = opts_for(td.path(), None, false);
+        on.release_enabled = true;
+        let (_, body) = get(&on, "/mails");
+        assert!(body.contains("Deliver anyway"));
+        // POST form, never a GET link
+        assert!(body.contains("method=post"));
+        assert!(body.contains(&format!("/mails/{stem}/release")));
+        assert!(body.contains("confirm("), "asks for confirmation");
+        // not offered for the whitelisted (non-spam) entry
+        assert!(!body.contains(&format!("/mails/{wl}/release")));
+    }
+
+    #[test]
+    fn mail_source_view_copies_exactly() {
+        // A mail with long lines (DKIM-ish) and CRLF: copying must not gain
+        // soft-wrap newlines, and must not lose a single byte.
+        let td = TempDir::new("src");
+        let raw = format!(
+            "From: a@b.example\r\nSubject: =?UTF-8?B?{}?=\r\nDKIM-Signature: v=1; a=rsa-sha256;\r\n\tverylongbas64={}\r\n\r\nbody line one\r\nbody line two\r\n",
+            "w4ViYW4=",
+            "A".repeat(300)
+        );
+        td.write("s.eml", &raw);
+        td.write(
+            "s.json",
+            r#"{"verdict":"spam","envelope_from":"a@b.example","outcomes":[]}"#,
+        );
+
+        let opts = opts_for(td.path(), None, false);
+        let (status, body) = get(&opts, "/mails/s");
+        assert!(status.contains("200"));
+
+        // container + copy affordances
+        assert!(body.contains("id=mailsrc"), "source container");
+        assert!(body.contains("class=body id=mailsrc"), "copyable body");
+        assert!(body.contains("double-click to select"));
+        assert!(body.contains("id=cpbtn"), "explicit copy button");
+
+        // The copy button MUST read from /raw. Copying out of the rendered
+        // HTML loses CRLF (the browser normalises line endings), which corrupts
+        // a pasted mail — this assertion guards that mistake.
+        let fetch_pos = body.find("await fetch('").expect("copy button uses fetch");
+        let q = fetch_pos + "await fetch('".len();
+        let fetched = &body[q..body[q..].find('\'').unwrap() + q];
+        assert!(
+            fetched.contains("/raw"),
+            "copy must come from /raw, got {fetched}"
+        );
+
+        // /raw serves the exact bytes
+        let (_, raw_resp) = get(&opts, "/mails/s/raw");
+        assert_eq!(raw_resp, raw, "raw route must be byte-identical");
+
+        // The rendered preview is for reading; long lines survive, but the
+        // browser may re-flow line endings, so it is not a copy source.
+        let s =
+            body.find("<pre class=body id=mailsrc>").unwrap() + "<pre class=body id=mailsrc>".len();
+        let e = body[s..].find("</pre>").unwrap() + s;
+        let decoded = html_unescape_for_test(&body[s..e]);
+        assert!(decoded.contains(&"A".repeat(300)), "long line intact");
+    }
+
+    #[test]
+    fn mail_source_warns_when_truncated() {
+        let td = TempDir::new("big");
+        td.write("big.eml", &"x".repeat(PREVIEW_LIMIT + 10_000));
+        td.write(
+            "big.json",
+            r#"{"verdict":"spam","envelope_from":"a@b","outcomes":[]}"#,
+        );
+        let opts = opts_for(td.path(), None, false);
+        let (_, body) = get(&opts, "/mails/big");
+        assert!(
+            body.contains("Preview truncated"),
+            "must warn about truncation"
+        );
+        // and the raw route still serves the whole thing
+        let (_, raw) = get(&opts, "/mails/big/raw");
+        assert_eq!(raw.len(), PREVIEW_LIMIT + 10_000, "raw is complete");
+    }
+
+    /// Inverse of html_escape for assertions only.
+    fn html_unescape_for_test(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
     fn list_quarantine_lists_newest_first_with_meta() {
         let td = quarantine_with_two_mails();
-        let (items, total) = list_quarantine(td.path(), "", 100, 0);
+        let (items, total) =
+            list_quarantine(td.path(), "", 100, 0, &mut QuarantineCache::default());
         assert_eq!(total, 2);
         // mtime ties are broken by stem, both files exist -> both returned
         assert_eq!(items.len(), 2);
@@ -1197,6 +2048,12 @@ mod tests {
         assert_eq!(spam.models.len(), 1);
         assert_eq!(spam.models[0].name, "jev-1.13"); // shortened from typesafe/jev-1.13
         assert!(spam.models[0].spam);
+        // score must survive the flatten -> it is a top-level key, not nested
+        assert!(
+            (spam.models[0].score - 0.95).abs() < 1e-6,
+            "score parsed from flattened sidecar, got {}",
+            spam.models[0].score
+        );
         assert!(spam.summary.contains("SPAM") || spam.summary.contains("spam"));
 
         let wl = items.iter().find(|m| m.stem.contains("q2")).unwrap();
@@ -1209,19 +2066,38 @@ mod tests {
     fn list_quarantine_search_and_paging() {
         let td = quarantine_with_two_mails();
         // case-insensitive sender / stem search
-        let (items, total) = list_quarantine(td.path(), "EVIL", 100, 0);
+        let (items, total) =
+            list_quarantine(td.path(), "EVIL", 100, 0, &mut QuarantineCache::default());
         assert_eq!(total, 1);
         assert!(items[0].stem.contains("q1"));
-        assert_eq!(list_quarantine(td.path(), "nomatch", 100, 0).1, 0);
+        assert_eq!(
+            list_quarantine(
+                td.path(),
+                "nomatch",
+                100,
+                0,
+                &mut QuarantineCache::default()
+            )
+            .1,
+            0
+        );
         // paging
-        let (page, total) = list_quarantine(td.path(), "", 1, 1);
+        let (page, total) = list_quarantine(td.path(), "", 1, 1, &mut QuarantineCache::default());
         assert_eq!(total, 2);
         assert_eq!(page.len(), 1);
         // limit is capped at 500
-        assert_eq!(list_quarantine(td.path(), "", 10_000, 0).0.len(), 2);
+        assert_eq!(
+            list_quarantine(td.path(), "", 10_000, 0, &mut QuarantineCache::default())
+                .0
+                .len(),
+            2
+        );
         // non-eml files are ignored
         td.write("notes.txt", "ignore me");
-        assert_eq!(list_quarantine(td.path(), "", 100, 0).1, 2);
+        assert_eq!(
+            list_quarantine(td.path(), "", 100, 0, &mut QuarantineCache::default()).1,
+            2
+        );
         assert_eq!(quarantine_count(td.path()), 2);
     }
 
@@ -1338,8 +2214,10 @@ mod tests {
         // unknown route
         assert!(get(&opts, "/nope").0.contains("404"));
         assert!(get(&opts, "/api/nope").0.contains("404"));
-        // non-GET
+        // POST is only routed for the release action; anything else still 405s
         let out = handle_request("POST /api/stats HTTP/1.1\r\n\r\n", &opts);
+        assert!(String::from_utf8_lossy(&out).contains("404"));
+        let out = handle_request("DELETE / HTTP/1.1\r\n\r\n", &opts);
         assert!(String::from_utf8_lossy(&out).contains("405"));
         // "/mails/" is the list route (200), not a mail detail lookup
         assert!(get(&opts, "/mails/").0.contains("200"));
@@ -1523,6 +2401,9 @@ mod tests {
             spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
             token: None,
             scramble_senders: false,
+            cache: Arc::new(std::sync::Mutex::new(QuarantineCache::default())),
+            eval_log: None,
+            release_enabled: false,
         };
         let raw = handle_request("GET / HTTP/1.1\r\n\r\n", &opts);
         let plain = String::from_utf8_lossy(&raw);
@@ -1629,6 +2510,9 @@ mod tests {
             spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
             token: None,
             scramble_senders: false,
+            cache: Arc::new(std::sync::Mutex::new(QuarantineCache::default())),
+            eval_log: None,
+            release_enabled: false,
         };
         let out = handle_request("GET / HTTP/1.1\r\n\r\n", &opts);
         let body = String::from_utf8_lossy(&out);
@@ -1641,6 +2525,9 @@ mod tests {
             spam_dir: PathBuf::from("/tmp/does-not-exist-xyz"),
             token: Some("s".into()),
             scramble_senders: false,
+            cache: Arc::new(std::sync::Mutex::new(QuarantineCache::default())),
+            eval_log: None,
+            release_enabled: false,
         };
         let out = handle_request("GET /?token=s HTTP/1.1\r\n\r\n", &opts_t);
         let body = String::from_utf8_lossy(&out);
